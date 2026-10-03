@@ -955,10 +955,37 @@ def print_summary(results: ScanResults):
     cprint("=" * 70, Colors.BOLD)
     cprint("  CLOUD BOUNDARY SCANNER  //  RESULTS SUMMARY", Colors.BOLD + Colors.CYAN)
     cprint("=" * 70, Colors.BOLD)
-    cprint(f"  Scanned Host:    {report['hostname']}", Colors.WHITE)
+
+    # Domain context
     if report.get("cloud_domain"):
-        cprint(f"  Cloud Domain:    {report['cloud_domain']}", Colors.WHITE)
+        cprint(f"  Cloud Tenant:    {report['cloud_domain']}", Colors.WHITE)
     cprint(f"  On-prem Domain:  {report['onprem_domain']}", Colors.WHITE)
+
+    # Surface discovered boundary servers from findings
+    boundary_servers = []
+    for f in report["findings"]:
+        if f["category"] in ("sync_services", "federation"):
+            # Extract server name from detail text
+            m = re.search(r"Entra Connect server:\s*(\S+)", f["detail"])
+            if m:
+                boundary_servers.append(
+                    (m.group(1).rstrip("."), f["title"]))
+            elif "ADFS server detected" in f["title"]:
+                boundary_servers.append(
+                    (report["hostname"], f["title"]))
+    if boundary_servers:
+        print()
+        cprint("  Boundary Servers Identified:", Colors.BOLD + Colors.MAGENTA)
+        seen = set()
+        for server, role in boundary_servers:
+            if server not in seen:
+                seen.add(server)
+                cprint(f"    {server}  —  {role}", Colors.MAGENTA)
+    else:
+        print()
+        cprint("  Boundary Servers:  none identified on this scan",
+               Colors.GRAY)
+
     if DEBUG_MODE:
         cprint(f"  Started:   {report['scan_start']}", Colors.GRAY)
         cprint(f"  Completed: {report['scan_end']}", Colors.GRAY)
