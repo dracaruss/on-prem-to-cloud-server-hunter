@@ -31,16 +31,16 @@ Run directly on a domain-joined Windows host. Uses the current user's session fo
 
 ```bash
 # Standard scan (shows only relevant findings)
-python cloud_boundary_scanner.py
+python cloud_boundary_scanner_win64.py
 
 # Save JSON report
-python cloud_boundary_scanner.py -o report.json
+python cloud_boundary_scanner_win64.py -o report.json
 
 # Full debug output (shows negative results and all checks)
-python cloud_boundary_scanner.py --debug
+python cloud_boundary_scanner_win64.py --debug
 
 # Combined
-python cloud_boundary_scanner.py -o report.json --debug
+python cloud_boundary_scanner_win64.py -o report.json --debug
 ```
 
 ### Kali Version
