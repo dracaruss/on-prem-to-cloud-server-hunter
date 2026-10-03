@@ -14,7 +14,6 @@ Requirements:
     - Python 3.8+
 
 Author: Russell (Thrive Offensive Security)
-License: For authorized testing only.
 """
 
 import argparse
@@ -142,6 +141,13 @@ CONFIG_EXTENSIONS = {
     ".properties",
 }
 
+# Directories to skip during file scanning (dev/tool artifacts, not real creds)
+DEFAULT_EXCLUDE_DIRS = {
+    ".venv", "venv", "env", ".env", "__pycache__", "site-packages",
+    "node_modules", ".git", ".tox", "dist-packages", "lib-python",
+    "SelfTest", ".mypy_cache", ".pytest_cache",
+}
+
 # ---------------------------------------------------------------------------
 # Finding / Results
 # ---------------------------------------------------------------------------
@@ -176,6 +182,10 @@ class ScanResults:
         # In normal mode, only print CRITICAL/HIGH/MEDIUM inline as they happen
         if finding.severity in ("CRITICAL", "HIGH", "MEDIUM"):
             cprint(f"  [+] [{finding.severity}] {finding.title}", color)
+            # Show evidence inline for credential findings so values are visible
+            if finding.evidence and finding.category == "credentials":
+                for eline in finding.evidence.splitlines():
+                    cprint(f"      {eline.strip()}", Colors.DIM)
         elif DEBUG_MODE:
             cprint(f"  [.] [{finding.severity}] {finding.title}", color)
 
@@ -365,34 +375,88 @@ def check_outbound_connections(results: ScanResults):
 
 def check_environment_variables(results: ScanResults):
     status("Checking environment variables...")
-    cloud_env_patterns = [
-        (r"AZURE", "Azure"), (r"AWS", "AWS"),
-        (r"GOOGLE_CLOUD|GCLOUD|GCP", "GCP"),
-        (r"TENANT.ID", "Tenant ID"), (r"CLIENT.SECRET", "Client secret"),
-        (r"(?:API|ACCESS|SECRET)[_\-]?KEY", "API/access key"),
+    # HIGH-value patterns: these likely hold actual secrets or IDs
+    secret_env_patterns = [
+        (r"(?i)TENANT.ID", "Tenant ID"),
+        (r"(?i)CLIENT.SECRET", "Client secret"),
+        (r"(?i)(?:API|ACCESS|SECRET)[_\-]?KEY", "API/access key"),
+        (r"(?i)(?:AWS_SECRET|AWS_ACCESS|AWS_SESSION)", "AWS credential"),
+        (r"(?i)AZURE[_\-]?(?:CLIENT|TENANT|SUBSCRIPTION)[_\-]?(?:ID|SECRET)", "Azure identity"),
+        (r"(?i)GOOGLE_APPLICATION_CREDENTIALS", "GCP credential"),
+    ]
+    # MEDIUM-value patterns: cloud presence indicators, not credentials
+    presence_env_patterns = [
+        (r"(?i)^AZURE", "Azure"),
+        (r"(?i)^AWS_", "AWS"),
+        (r"(?i)^GOOGLE_CLOUD|^GCLOUD|^GCP", "GCP"),
     ]
     found = False
     for var_name, var_value in os.environ.items():
-        for pattern, label in cloud_env_patterns:
-            if re.search(pattern, var_name, re.IGNORECASE):
+        # Check high-value secret patterns first
+        matched = False
+        for pattern, label in secret_env_patterns:
+            if re.search(pattern, var_name):
                 found = True
-                masked = var_value[:4] + "****" if len(var_value) > 4 else "****"
+                matched = True
                 results.add(Finding(
                     "credentials",
                     f"Cloud env var: {var_name}",
                     f"Environment variable {var_name} matches pattern for "
                     f"{label}. Accessible to any process as this user.",
-                    severity="HIGH", evidence=f"{var_name}={masked}",
+                    severity="HIGH", evidence=f"{var_name}={var_value}",
+                ))
+                break
+        if matched:
+            continue
+        # Then check general cloud presence indicators
+        for pattern, label in presence_env_patterns:
+            if re.search(pattern, var_name):
+                found = True
+                results.add(Finding(
+                    "credentials",
+                    f"Cloud env var: {var_name}",
+                    f"Environment variable {var_name} indicates {label} "
+                    f"presence on this host.",
+                    severity="MEDIUM", evidence=f"{var_name}={var_value}",
                 ))
                 break
     if not found:
         debug("No cloud-related environment variables found.")
 
 
-def check_credential_files(results: ScanResults):
+def _is_excluded_path(filepath: Path, extra_excludes: list[str]) -> bool:
+    """Check if any path component matches an excluded directory."""
+    parts = set(p.lower() for p in filepath.parts)
+    for excl in DEFAULT_EXCLUDE_DIRS:
+        if excl.lower() in parts:
+            return True
+    for excl in extra_excludes:
+        if excl.lower() in parts or excl.lower() in str(filepath).lower():
+            return True
+    return False
+
+
+def _extract_match_context(content: str, pattern: str, max_lines: int = 3) -> str:
+    """Extract the actual matching lines from file content."""
+    matches = []
+    for line in content.splitlines():
+        if re.search(pattern, line):
+            clean = line.strip()
+            if len(clean) > 300:
+                clean = clean[:300] + "..."
+            matches.append(clean)
+            if len(matches) >= max_lines:
+                break
+    return "\n    ".join(matches) if matches else "(pattern matched but no printable line)"
+
+
+def check_credential_files(results: ScanResults, extra_excludes: list[str] = None):
     status("Scanning filesystem for cloud credentials...")
+    if extra_excludes is None:
+        extra_excludes = []
     scanned = 0
     hits = 0
+    skipped = 0
     max_file_size = 5 * 1024 * 1024
 
     search_roots = []
@@ -425,6 +489,9 @@ def check_credential_files(results: ScanResults):
                     continue
                 if filepath.suffix.lower() not in CONFIG_EXTENSIONS:
                     continue
+                if _is_excluded_path(filepath, extra_excludes):
+                    skipped += 1
+                    continue
                 if filepath.stat().st_size > max_file_size:
                     continue
                 scanned += 1
@@ -435,19 +502,19 @@ def check_credential_files(results: ScanResults):
                 for pattern, label in CREDENTIAL_PATTERNS:
                     if re.search(pattern, content):
                         hits += 1
+                        matched_lines = _extract_match_context(content, pattern)
                         results.add(Finding(
                             "credentials",
                             f"Cloud credential in file: {filepath.name}",
-                            f"File {filepath} matches pattern \"{label}\". "
-                            f"Review for embedded secrets enabling cloud pivot.",
+                            f"File {filepath} matches pattern \"{label}\".",
                             severity="HIGH",
-                            evidence=f"Pattern: {label}, File: {filepath}",
+                            evidence=f"File: {filepath}\n    {matched_lines}",
                         ))
                         break
         except PermissionError:
             pass
 
-    debug(f"File scan complete: {scanned} files scanned, {hits} hits.")
+    debug(f"File scan complete: {scanned} scanned, {hits} hits, {skipped} skipped (excluded dirs).")
 
 
 def check_aws_profiles(results: ScanResults):
@@ -669,13 +736,14 @@ def check_network_shares_for_cloud_scripts(results: ScanResults):
                         content = open(fpath, "r", errors="ignore").read()
                         for pattern, label in CREDENTIAL_PATTERNS:
                             if re.search(pattern, content):
+                                matched_lines = _extract_match_context(content, pattern)
                                 results.add(Finding(
                                     "credentials",
                                     f"Cloud credential in share: {fname}",
                                     f"File {fpath} on a domain share matches "
                                     f"\"{label}\". Readable by all domain users.",
                                     severity="CRITICAL",
-                                    evidence=f"File: {fpath}, Pattern: {label}",
+                                    evidence=f"File: {fpath}\n    {matched_lines}",
                                 ))
                                 break
                     except (PermissionError, OSError):
@@ -727,7 +795,7 @@ def print_summary(results: ScanResults):
             cprint(f"  [{finding.severity}] {finding.title}", color)
             cprint(f"    {finding.detail}", Colors.WHITE)
             if finding.evidence:
-                cprint(f"    Evidence: {finding.evidence[:200]}", Colors.DIM)
+                cprint(f"    Evidence: {finding.evidence[:500]}", Colors.DIM)
 
     print()
     cprint("=" * 70, Colors.BOLD)
@@ -742,24 +810,29 @@ def main():
     global DEBUG_MODE
 
     parser = argparse.ArgumentParser(
-        description="Cloud Boundary Scanner (Windows) for authorized pentests.")
+        description="Cloud Boundary Scanner (Windows)")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Write JSON report to file.")
     parser.add_argument("--debug", action="store_true",
                         help="Show all debug output including negative results.")
+    parser.add_argument("--exclude-path", action="append", default=[],
+                        metavar="DIR",
+                        help="Additional directory names to skip during file "
+                             "scanning (repeatable). .venv, site-packages, "
+                             "node_modules etc. are excluded by default.")
     args = parser.parse_args()
 
     DEBUG_MODE = args.debug
 
-    cprint("\n  Cloud Boundary Scanner (Windows)", Colors.BOLD + Colors.CYAN)
-    cprint("  For authorized penetration testing only.\n", Colors.DIM)
+    cprint("\n  Cloud Boundary Scanner (Windows)\n", Colors.BOLD + Colors.CYAN)
 
     results = ScanResults()
 
     modules = [
         check_sync_services, check_adfs, check_cloud_dns,
         check_outbound_connections, check_environment_variables,
-        check_credential_files, check_aws_profiles, check_azure_cli,
+        lambda r: check_credential_files(r, extra_excludes=args.exclude_path),
+        check_aws_profiles, check_azure_cli,
         check_scheduled_tasks, check_registry_cloud_agents,
         check_conditional_access_indicators,
         check_network_shares_for_cloud_scripts,
@@ -769,7 +842,8 @@ def main():
         try:
             module(results)
         except Exception as exc:
-            cprint(f"  [!] Module {module.__name__} failed: {exc}",
+            name = getattr(module, "__name__", "check_credential_files")
+            cprint(f"  [!] Module {name} failed: {exc}",
                    Colors.YELLOW)
 
     print_summary(results)
