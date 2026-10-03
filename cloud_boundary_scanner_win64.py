@@ -109,20 +109,41 @@ CLOUD_DOMAINS = {
     ],
 }
 
+# Tier 1 (HIGH): patterns that match actual credential VALUES or exportable secrets
 CREDENTIAL_PATTERNS = [
-    (r"(?i)AZURE[_\-]?(?:CLIENT|TENANT|SUBSCRIPTION)[_\-]?(?:ID|SECRET)", "Azure credential variable"),
-    (r"(?i)AZURE[_\-]?(?:STORAGE|ACCOUNT)[_\-]?KEY", "Azure storage key"),
-    (r"(?i)SharedAccessSignature=", "Azure SAS token"),
-    (r"(?i)DefaultEndpointsProtocol=https;AccountName=", "Azure connection string"),
-    (r"(?i)\.microsoftonline\.com", "Microsoft Online endpoint reference"),
-    (r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}", "AWS access key ID"),
-    (r"(?i)aws_secret_access_key\s*=", "AWS secret key assignment"),
-    (r"(?i)aws_session_token\s*=", "AWS session token"),
-    (r'"type"\s*:\s*"service_account"', "GCP service account JSON key"),
-    (r"(?i)GOOGLE_APPLICATION_CREDENTIALS", "GCP application credentials env var"),
-    (r"(?i)(?:api[_\-]?key|apikey|secret[_\-]?key|access[_\-]?token)\s*[:=]", "Generic API key or token"),
-    (r"(?i)-----BEGIN (?:RSA )?PRIVATE KEY-----", "Private key (PEM)"),
+    (r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}",
+     "AWS access key ID"),
+    (r"(?i)aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{20,}",
+     "AWS secret access key"),
+    (r"(?i)aws_session_token\s*=\s*\S{20,}",
+     "AWS session token"),
+    (r"(?i)SharedAccessSignature=sv=[^\s&\"']{20,}",
+     "Azure SAS token"),
+    (r"(?i)DefaultEndpointsProtocol=https;AccountName=[^;\"']+;AccountKey=[^;\"']+",
+     "Azure storage connection string"),
+    (r"(?i)AccountKey=[A-Za-z0-9/+=]{80,}",
+     "Azure storage account key"),
+    (r'"type"\s*:\s*"service_account"',
+     "GCP service account JSON key"),
+    (r"(?i)-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+     "Private key (PEM)"),
 ]
+
+# Tier 2 (MEDIUM): credential-adjacent patterns, variable names with values assigned
+CREDENTIAL_REF_PATTERNS = [
+    (r"(?i)AZURE[_\-]?(?:CLIENT|TENANT|SUBSCRIPTION)[_\-]?(?:ID|SECRET)\s*[:=]\s*\S+",
+     "Azure credential variable with value"),
+    (r"(?i)AZURE[_\-]?(?:STORAGE|ACCOUNT)[_\-]?KEY\s*[:=]\s*\S+",
+     "Azure storage key variable"),
+    (r"(?i)(?:client[_\-]?secret|client[_\-]?key)\s*[:=]\s*[\"'][^\"']{16,}[\"']",
+     "Client secret or key"),
+    (r"(?i)(?:api[_\-]?key|secret[_\-]?key|access[_\-]?token)\s*[:=]\s*[\"'][^\"']{16,}[\"']",
+     "API key or token with value"),
+    (r"(?i)GOOGLE_APPLICATION_CREDENTIALS\s*[:=]\s*\S+",
+     "GCP credentials path"),
+]
+
+SCANNER_FILENAME = "cloud_boundary_scanner"  # exclude self from results
 
 SYNC_SERVICES = [
     ("Microsoft Azure AD Sync", "Entra Connect Sync (legacy name)"),
@@ -175,6 +196,26 @@ class ScanResults:
         self.findings: list[Finding] = []
         self.scan_start = datetime.utcnow().isoformat()
         self.hostname = platform.node()
+        self.host_ip = self._get_host_ip()
+        self.domain = self._get_domain()
+
+    @staticmethod
+    def _get_host_ip() -> str:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 53))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _get_domain() -> str:
+        domain = os.environ.get("USERDNSDOMAIN", "")
+        if not domain or "%" in domain:
+            domain = os.environ.get("USERDOMAIN", "WORKGROUP")
+        return domain
 
     def add(self, finding: Finding):
         self.findings.append(finding)
@@ -194,6 +235,8 @@ class ScanResults:
             "scan_start": self.scan_start,
             "scan_end": datetime.utcnow().isoformat(),
             "hostname": self.hostname,
+            "host_ip": self.host_ip,
+            "domain": self.domain,
             "total_findings": len(self.findings),
             "severity_counts": {
                 s: sum(1 for f in self.findings if f.severity == s)
@@ -492,6 +535,9 @@ def check_credential_files(results: ScanResults, extra_excludes: list[str] = Non
                 if _is_excluded_path(filepath, extra_excludes):
                     skipped += 1
                     continue
+                # Skip the scanner itself
+                if SCANNER_FILENAME in filepath.name.lower():
+                    continue
                 if filepath.stat().st_size > max_file_size:
                     continue
                 scanned += 1
@@ -499,18 +545,38 @@ def check_credential_files(results: ScanResults, extra_excludes: list[str] = Non
                     content = filepath.read_text(errors="ignore")
                 except (PermissionError, OSError):
                     continue
+
+                # Check tier 1 patterns first (actual credential values)
+                matched = False
                 for pattern, label in CREDENTIAL_PATTERNS:
                     if re.search(pattern, content):
                         hits += 1
+                        matched = True
                         matched_lines = _extract_match_context(content, pattern)
                         results.add(Finding(
                             "credentials",
-                            f"Cloud credential in file: {filepath.name}",
-                            f"File {filepath} matches pattern \"{label}\".",
+                            f"Credential found: {filepath.name}",
+                            f"{label} in {filepath}",
                             severity="HIGH",
                             evidence=f"File: {filepath}\n    {matched_lines}",
                         ))
                         break
+
+                # If no tier 1 match, check tier 2 (credential references)
+                if not matched:
+                    for pattern, label in CREDENTIAL_REF_PATTERNS:
+                        if re.search(pattern, content):
+                            hits += 1
+                            matched_lines = _extract_match_context(
+                                content, pattern)
+                            results.add(Finding(
+                                "credentials",
+                                f"Possible credential ref: {filepath.name}",
+                                f"{label} in {filepath}",
+                                severity="MEDIUM",
+                                evidence=f"File: {filepath}\n    {matched_lines}",
+                            ))
+                            break
         except PermissionError:
             pass
 
@@ -734,18 +800,31 @@ def check_network_shares_for_cloud_scripts(results: ScanResults):
                         continue
                     try:
                         content = open(fpath, "r", errors="ignore").read()
+                        found_in_share = False
                         for pattern, label in CREDENTIAL_PATTERNS:
                             if re.search(pattern, content):
+                                found_in_share = True
                                 matched_lines = _extract_match_context(content, pattern)
                                 results.add(Finding(
                                     "credentials",
-                                    f"Cloud credential in share: {fname}",
-                                    f"File {fpath} on a domain share matches "
-                                    f"\"{label}\". Readable by all domain users.",
+                                    f"Credential on share: {fname}",
+                                    f"{label} in {fpath}. Readable by all domain users.",
                                     severity="CRITICAL",
                                     evidence=f"File: {fpath}\n    {matched_lines}",
                                 ))
                                 break
+                        if not found_in_share:
+                            for pattern, label in CREDENTIAL_REF_PATTERNS:
+                                if re.search(pattern, content):
+                                    matched_lines = _extract_match_context(content, pattern)
+                                    results.add(Finding(
+                                        "credentials",
+                                        f"Possible credential ref on share: {fname}",
+                                        f"{label} in {fpath}. Readable by all domain users.",
+                                        severity="HIGH",
+                                        evidence=f"File: {fpath}\n    {matched_lines}",
+                                    ))
+                                    break
                     except (PermissionError, OSError):
                         pass
         except (PermissionError, OSError):
@@ -763,9 +842,11 @@ def print_summary(results: ScanResults):
     cprint("=" * 70, Colors.BOLD)
     cprint("  CLOUD BOUNDARY SCANNER  //  RESULTS SUMMARY", Colors.BOLD + Colors.CYAN)
     cprint("=" * 70, Colors.BOLD)
-    cprint(f"  Host:      {report['hostname']}", Colors.WHITE)
-    cprint(f"  Started:   {report['scan_start']}", Colors.WHITE)
-    cprint(f"  Completed: {report['scan_end']}", Colors.WHITE)
+    cprint(f"  Host:    {report['hostname']}  ({report['host_ip']})", Colors.WHITE)
+    cprint(f"  Domain:  {report['domain']}", Colors.WHITE)
+    if DEBUG_MODE:
+        cprint(f"  Started:   {report['scan_start']}", Colors.GRAY)
+        cprint(f"  Completed: {report['scan_end']}", Colors.GRAY)
     print()
 
     total = report["total_findings"]
@@ -785,19 +866,6 @@ def print_summary(results: ScanResults):
     if report["severity_counts"]["INFO"]:
         cprint(f"    INFO     : {report['severity_counts']['INFO']}", Colors.GRAY)
 
-    cprint("=" * 70, Colors.BOLD)
-
-    # Detail for CRITICAL and HIGH
-    for finding in results.findings:
-        if finding.severity in ("CRITICAL", "HIGH"):
-            color = Colors.severity_color(finding.severity)
-            print()
-            cprint(f"  [{finding.severity}] {finding.title}", color)
-            cprint(f"    {finding.detail}", Colors.WHITE)
-            if finding.evidence:
-                cprint(f"    Evidence: {finding.evidence[:500]}", Colors.DIM)
-
-    print()
     cprint("=" * 70, Colors.BOLD)
     print()
 
@@ -824,7 +892,9 @@ def main():
 
     DEBUG_MODE = args.debug
 
-    cprint("\n  Cloud Boundary Scanner (Windows)\n", Colors.BOLD + Colors.CYAN)
+    print()
+    cprint("  Cloud Boundary Scanner (Windows)", Colors.BOLD + Colors.CYAN)
+    print()
 
     results = ScanResults()
 
