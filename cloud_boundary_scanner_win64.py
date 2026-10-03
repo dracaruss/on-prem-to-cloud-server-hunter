@@ -86,6 +86,45 @@ def status(msg: str):
     cprint(f"  [*] {msg}", Colors.CYAN)
 
 
+def _enable_windows_vt_processing():
+    """Enable ANSI/VT100 escape sequence processing on Windows consoles.
+
+    Windows PowerShell and cmd.exe do not process ANSI escape codes by
+    default.  This flips the ENABLE_VIRTUAL_TERMINAL_PROCESSING flag via
+    the Win32 API so \\033[...m sequences render as colors instead of
+    printing as raw text (the ?[1m?[96m artifacts Russell was seeing).
+
+    Must be called BEFORE any ANSI output.  The reason later status lines
+    rendered correctly was that the first subprocess call (sc query, etc.)
+    incidentally enabled VT processing as a side effect — this function
+    does it explicitly at startup.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        STD_OUTPUT_HANDLE = -11
+        STD_ERROR_HANDLE = -12
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+        for handle_id in (STD_OUTPUT_HANDLE, STD_ERROR_HANDLE):
+            handle = kernel32.GetStdHandle(handle_id)
+            if handle == 0 or handle == wintypes.HANDLE(-1).value:
+                continue
+            mode = wintypes.DWORD()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                continue
+            mode.value |= ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            kernel32.SetConsoleMode(handle, mode)
+    except Exception:
+        # Fallback: launching a subprocess briefly enables VT processing
+        # as a side effect on many Windows builds.
+        os.system("")
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -197,7 +236,8 @@ class ScanResults:
         self.scan_start = datetime.utcnow().isoformat()
         self.hostname = platform.node()
         self.host_ip = self._get_host_ip()
-        self.domain = self._get_domain()
+        self.onprem_domain = self._get_onprem_domain()
+        self.cloud_domain = self._get_cloud_domain()
 
     @staticmethod
     def _get_host_ip() -> str:
@@ -211,11 +251,36 @@ class ScanResults:
             return "unknown"
 
     @staticmethod
-    def _get_domain() -> str:
+    def _get_onprem_domain() -> str:
+        """Detect the on-prem Active Directory domain name."""
+        # USERDNSDOMAIN holds the FQDN (e.g. corp.local) for the logged-in user
         domain = os.environ.get("USERDNSDOMAIN", "")
-        if not domain or "%" in domain:
-            domain = os.environ.get("USERDOMAIN", "WORKGROUP")
-        return domain
+        if domain and "%" not in domain:
+            return domain
+        # WMI via PowerShell returns the FQDN even when the env var is empty
+        wmi = run_powershell(
+            "(Get-WmiObject Win32_ComputerSystem).Domain")
+        if wmi and wmi.strip() and "." in wmi.strip():
+            return wmi.strip()
+        # Last resort: NetBIOS domain name
+        nb = os.environ.get("USERDOMAIN", "")
+        return nb if nb and "%" not in nb else "WORKGROUP"
+
+    @staticmethod
+    def _get_cloud_domain() -> str:
+        """Detect the Entra ID / Azure AD tenant from device join info."""
+        output = run_cmd("dsregcmd /status")
+        if not output:
+            return ""
+        # Try TenantName first, then DomainName
+        for key in ("TenantName", "DomainName"):
+            for line in output.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(key) and ":" in stripped:
+                    val = stripped.split(":", 1)[1].strip()
+                    if val and val.lower() not in ("", "n/a", "none"):
+                        return val
+        return ""
 
     def add(self, finding: Finding):
         self.findings.append(finding)
@@ -236,7 +301,8 @@ class ScanResults:
             "scan_end": datetime.utcnow().isoformat(),
             "hostname": self.hostname,
             "host_ip": self.host_ip,
-            "domain": self.domain,
+            "onprem_domain": self.onprem_domain,
+            "cloud_domain": self.cloud_domain,
             "total_findings": len(self.findings),
             "severity_counts": {
                 s: sum(1 for f in self.findings if f.severity == s)
@@ -301,20 +367,67 @@ def check_sync_services(results: ScanResults):
     if not found_any:
         debug("No cloud sync services found on this host.")
 
-    # MSOL_ account
+    # MSOL_ account — pull Description, which contains the server name
     msol_check = run_powershell(
         "Get-ADUser -Filter {SamAccountName -like 'MSOL_*'} "
-        "| Select-Object SamAccountName, Enabled | ConvertTo-Json")
+        "-Properties Description "
+        "| Select-Object SamAccountName, Enabled, Description "
+        "| ConvertTo-Json")
     if msol_check and "MSOL_" in msol_check:
-        results.add(Finding(
-            "sync_services", "MSOL sync service account found in AD",
+        # Extract the boundary server name from the description field
+        # Format: "...running on computer [HOSTNAME] configured to synchronize to tenant [TENANT]..."
+        server_hint = ""
+        tenant_hint = ""
+        m_srv = re.search(r"running on computer\s+(\S+)", msol_check, re.IGNORECASE)
+        if m_srv:
+            server_hint = m_srv.group(1).rstrip(".")
+        m_ten = re.search(r"synchronize to tenant\s+(\S+)", msol_check, re.IGNORECASE)
+        if m_ten:
+            tenant_hint = m_ten.group(1).rstrip(".")
+
+        detail = (
             "The MSOL_ account is the Entra Connect directory sync account. "
             "It holds DCSync-equivalent privileges on-prem and write access "
-            "in the Entra tenant.",
-            severity="CRITICAL", evidence=msol_check[:500],
+            "in the Entra tenant."
+        )
+        if server_hint:
+            detail += f" Entra Connect server: {server_hint}."
+        if tenant_hint:
+            detail += f" Target tenant: {tenant_hint}."
+
+        results.add(Finding(
+            "sync_services", "MSOL sync service account found in AD",
+            detail, severity="CRITICAL", evidence=msol_check[:500],
         ))
     else:
         debug("No MSOL_ service account found in AD.")
+
+    # Entra Connect Service Connection Point — readable by any domain user,
+    # confirms Entra Connect is deployed and names the cloud tenant.
+    scp_check = run_powershell(
+        "$configNC = (Get-ADRootDSE).configurationNamingContext; "
+        "Get-ADObject -SearchBase \\\"CN=Device Registration Configuration,"
+        "CN=Services,$configNC\\\" "
+        "-Filter {objectClass -eq 'serviceConnectionPoint'} "
+        "-Properties keywords "
+        "| Select-Object DistinguishedName, keywords "
+        "| ConvertTo-Json")
+    if scp_check and "azureAD" in scp_check.lower():
+        # Pull tenant name from keywords like "azureADName:contoso.onmicrosoft.com"
+        tenant_from_scp = ""
+        m_ad = re.search(r"azureADName[:\s]+(\S+)", scp_check, re.IGNORECASE)
+        if m_ad:
+            tenant_from_scp = m_ad.group(1)
+        results.add(Finding(
+            "sync_services",
+            "Entra Connect Service Connection Point in AD",
+            f"The Entra Connect SCP is registered in the AD configuration "
+            f"partition, confirming hybrid identity sync is deployed."
+            + (f" Cloud tenant: {tenant_from_scp}." if tenant_from_scp else ""),
+            severity="HIGH", evidence=scp_check[:500],
+        ))
+    else:
+        debug("No Entra Connect SCP found in AD configuration partition.")
 
     # ADSync database
     adsync_db_paths = [
@@ -842,8 +955,10 @@ def print_summary(results: ScanResults):
     cprint("=" * 70, Colors.BOLD)
     cprint("  CLOUD BOUNDARY SCANNER  //  RESULTS SUMMARY", Colors.BOLD + Colors.CYAN)
     cprint("=" * 70, Colors.BOLD)
-    cprint(f"  Host:    {report['hostname']}  ({report['host_ip']})", Colors.WHITE)
-    cprint(f"  Domain:  {report['domain']}", Colors.WHITE)
+    cprint(f"  Scanned Host:    {report['hostname']}", Colors.WHITE)
+    if report.get("cloud_domain"):
+        cprint(f"  Cloud Domain:    {report['cloud_domain']}", Colors.WHITE)
+    cprint(f"  On-prem Domain:  {report['onprem_domain']}", Colors.WHITE)
     if DEBUG_MODE:
         cprint(f"  Started:   {report['scan_start']}", Colors.GRAY)
         cprint(f"  Completed: {report['scan_end']}", Colors.GRAY)
@@ -891,6 +1006,10 @@ def main():
     args = parser.parse_args()
 
     DEBUG_MODE = args.debug
+
+    # Enable ANSI color support on Windows terminals before any output.
+    # Without this, the first lines print raw escape codes (?[1m?[96m).
+    _enable_windows_vt_processing()
 
     print()
     cprint("  Cloud Boundary Scanner (Windows)", Colors.BOLD + Colors.CYAN)
