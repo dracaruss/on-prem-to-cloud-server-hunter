@@ -367,13 +367,30 @@ def check_sync_services(results: ScanResults):
     if not found_any:
         debug("No cloud sync services found on this host.")
 
-    # MSOL_ account — pull Description, which contains the server name
+    # MSOL_ account — try ADSI first (works without RSAT), then RSAT cmdlet
+    debug("Querying AD for MSOL_ sync account (ADSI)...")
     msol_check = run_powershell(
-        "Get-ADUser -Filter {SamAccountName -like 'MSOL_*'} "
-        "-Properties Description "
-        "| Select-Object SamAccountName, Enabled, Description "
-        "| ConvertTo-Json")
+        "$s = New-Object DirectoryServices.DirectorySearcher;"
+        "$s.Filter = '(&(objectCategory=person)(objectClass=user)"
+        "(samAccountName=MSOL_*))';"
+        "$s.PropertiesToLoad.AddRange(@('samaccountname','description'));"
+        "$r = $s.FindAll();"
+        "foreach($e in $r){"
+        "  $p = $e.Properties;"
+        "  [PSCustomObject]@{"
+        "    SamAccountName=$p['samaccountname'][0];"
+        "    Description=if($p['description']){$p['description'][0]}else{''}"
+        "  }"
+        "} | ConvertTo-Json")
+    if not msol_check or "MSOL_" not in msol_check:
+        debug("ADSI MSOL_ query returned nothing, trying RSAT Get-ADUser...")
+        msol_check = run_powershell(
+            "Get-ADUser -Filter {SamAccountName -like 'MSOL_*'} "
+            "-Properties Description "
+            "| Select-Object SamAccountName, Enabled, Description "
+            "| ConvertTo-Json")
     if msol_check and "MSOL_" in msol_check:
+        debug(f"MSOL_ account found: {msol_check[:200]}")
         # Extract the boundary server name from the description field
         # Format: "...running on computer [HOSTNAME] configured to synchronize to tenant [TENANT]..."
         server_hint = ""
@@ -400,20 +417,38 @@ def check_sync_services(results: ScanResults):
             detail, severity="CRITICAL", evidence=msol_check[:500],
         ))
     else:
-        debug("No MSOL_ service account found in AD.")
+        debug("No MSOL_ service account found in AD (tried ADSI and RSAT).")
 
-    # Entra Connect Service Connection Point — readable by any domain user,
-    # confirms Entra Connect is deployed and names the cloud tenant.
+    # Entra Connect Service Connection Point — try ADSI first, then RSAT
+    debug("Querying AD for Entra Connect SCP (ADSI)...")
     scp_check = run_powershell(
-        "$configNC = (Get-ADRootDSE).configurationNamingContext; "
-        "Get-ADObject -SearchBase \\\"CN=Device Registration Configuration,"
-        "CN=Services,$configNC\\\" "
-        "-Filter {objectClass -eq 'serviceConnectionPoint'} "
-        "-Properties keywords "
-        "| Select-Object DistinguishedName, keywords "
-        "| ConvertTo-Json")
+        "$root = [ADSI]'LDAP://RootDSE';"
+        "$configNC = $root.configurationNamingContext;"
+        "$s = New-Object DirectoryServices.DirectorySearcher;"
+        "$s.SearchRoot = [ADSI]\\\"LDAP://CN=Device Registration Configuration,"
+        "CN=Services,$configNC\\\";"
+        "$s.Filter = '(objectClass=serviceConnectionPoint)';"
+        "$s.PropertiesToLoad.AddRange(@('keywords','distinguishedname'));"
+        "$r = $s.FindAll();"
+        "foreach($e in $r){"
+        "  $p = $e.Properties;"
+        "  [PSCustomObject]@{"
+        "    DN=$p['distinguishedname'][0];"
+        "    Keywords=($p['keywords'] -join ',')"
+        "  }"
+        "} | ConvertTo-Json")
+    if not scp_check or "azureAD" not in scp_check.lower():
+        debug("ADSI SCP query returned nothing, trying RSAT Get-ADObject...")
+        scp_check = run_powershell(
+            "$configNC = (Get-ADRootDSE).configurationNamingContext; "
+            "Get-ADObject -SearchBase \\\"CN=Device Registration Configuration,"
+            "CN=Services,$configNC\\\" "
+            "-Filter {objectClass -eq 'serviceConnectionPoint'} "
+            "-Properties keywords "
+            "| Select-Object DistinguishedName, keywords "
+            "| ConvertTo-Json")
     if scp_check and "azureAD" in scp_check.lower():
-        # Pull tenant name from keywords like "azureADName:contoso.onmicrosoft.com"
+        debug(f"Entra Connect SCP found: {scp_check[:200]}")
         tenant_from_scp = ""
         m_ad = re.search(r"azureADName[:\s]+(\S+)", scp_check, re.IGNORECASE)
         if m_ad:
@@ -427,7 +462,7 @@ def check_sync_services(results: ScanResults):
             severity="HIGH", evidence=scp_check[:500],
         ))
     else:
-        debug("No Entra Connect SCP found in AD configuration partition.")
+        debug("No Entra Connect SCP found in AD (tried ADSI and RSAT).")
 
     # ADSync database
     adsync_db_paths = [
@@ -861,10 +896,28 @@ def check_conditional_access_indicators(results: ScanResults):
     if not is_windows():
         return
 
+    # Try ADSI first (works without RSAT), then RSAT cmdlet
+    debug("Querying AD for AZUREADSSOACC$ Seamless SSO account (ADSI)...")
     sso_check = run_powershell(
-        "Get-ADComputer -Filter {SamAccountName -eq 'AZUREADSSOACC$'} "
-        "| Select-Object SamAccountName, Enabled | ConvertTo-Json")
+        "$s = New-Object DirectoryServices.DirectorySearcher;"
+        "$s.Filter = '(&(objectCategory=computer)"
+        "(samAccountName=AZUREADSSOACC$))';"
+        "$s.PropertiesToLoad.AddRange(@('samaccountname','dnshostname'));"
+        "$r = $s.FindOne();"
+        "if($r){"
+        "  $p = $r.Properties;"
+        "  [PSCustomObject]@{"
+        "    SamAccountName=$p['samaccountname'][0];"
+        "    DnsHostName=if($p['dnshostname']){$p['dnshostname'][0]}else{''}"
+        "  } | ConvertTo-Json"
+        "}")
+    if not sso_check or "AZUREADSSOACC" not in sso_check:
+        debug("ADSI SSO query returned nothing, trying RSAT Get-ADComputer...")
+        sso_check = run_powershell(
+            "Get-ADComputer -Filter {SamAccountName -eq 'AZUREADSSOACC$'} "
+            "| Select-Object SamAccountName, Enabled | ConvertTo-Json")
     if sso_check and "AZUREADSSOACC" in sso_check:
+        debug(f"AZUREADSSOACC$ found: {sso_check[:200]}")
         results.add(Finding(
             "federation",
             "Seamless SSO account found (AZUREADSSOACC$)",
@@ -873,7 +926,7 @@ def check_conditional_access_indicators(results: ScanResults):
             severity="CRITICAL", evidence=sso_check[:300],
         ))
     else:
-        debug("AZUREADSSOACC$ not found in AD.")
+        debug("AZUREADSSOACC$ not found in AD (tried ADSI and RSAT).")
 
     prt_check = run_cmd("dsregcmd /status")
     if prt_check and "AzureAdPrt : YES" in prt_check:
