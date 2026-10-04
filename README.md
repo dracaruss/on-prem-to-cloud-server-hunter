@@ -2,8 +2,6 @@
 
 Enumerates the on-prem to cloud boundary during authorized penetration tests. Finds sync services, cached cloud credentials, federation misconfigurations, cloud bridge agents, and pivot paths between Active Directory and cloud tenants (Azure/Entra ID, AWS, GCP).
 
-The credential file scan segment of this tool is a cloud-scoped LaZagne style scanner, that scours the filesystem for cloud-specific secrets, like AWS access keys hardcoded in scripts, Azure SAS tokens in config files, GCP service account JSON keys, PEM private keys, and connection strings. The idea is that admins leave these in PowerShell scripts, .env files, config files on SYSVOL, scheduled task scripts, and similar places. Finding an AWS secret key in a .ps1 on NETLOGON is an instant pivot to cloud from on-prem, which is exactly the boundary crossing this tool is about.
-
 Two versions are included: one for Windows-based engagements and one for Kali-based engagements.
 
 ## What It Checks
@@ -104,7 +102,7 @@ python3 cloud_boundary_scanner_kali.py -u 'CORP\jsmith' -p 'Password1' -dc 10.0.
 
 ## Output
 
-Both scripts default to verbose output with color-coded severity for every check as it runs. The final summary lists all findings by severity with detail on CRITICAL and HIGH items, the identified boundary servers, and the detected on-prem and cloud domains.
+Both scripts default to verbose output with color-coded importance for every check as it runs. Findings are labeled KEY, NOTABLE, RELEVANT, or INFO based on how significant the information is to understanding the cloud boundary. The final summary lists all findings, the identified boundary servers with resolved IPs, the detected on-prem and cloud domains, and a boundary analysis with attack paths.
 
 When the Windows version is run with `-dc`, the summary also shows the remote DC being queried and which domain it belongs to.
 

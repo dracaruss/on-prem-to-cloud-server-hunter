@@ -49,9 +49,9 @@ class Colors:
     @staticmethod
     def severity_color(severity: str) -> str:
         return {
-            "CRITICAL": Colors.RED + Colors.BOLD,
-            "HIGH": Colors.RED,
-            "MEDIUM": Colors.YELLOW,
+            "KEY": Colors.RED + Colors.BOLD,
+            "NOTABLE": Colors.RED,
+            "RELEVANT": Colors.YELLOW,
             "LOW": Colors.CYAN,
             "INFO": Colors.GRAY,
         }.get(severity, Colors.WHITE)
@@ -302,8 +302,8 @@ class ScanResults:
     def add(self, finding: Finding):
         self.findings.append(finding)
         color = Colors.severity_color(finding.severity)
-        # In normal mode, only print CRITICAL/HIGH/MEDIUM inline as they happen
-        if finding.severity in ("CRITICAL", "HIGH", "MEDIUM"):
+        # In normal mode, only print KEY/NOTABLE/RELEVANT inline as they happen
+        if finding.severity in ("KEY", "NOTABLE", "RELEVANT"):
             cprint(f"  [+] [{finding.severity}] {finding.title}", color)
             # Show evidence inline for credential findings so values are visible
             if finding.evidence and finding.category == "credentials":
@@ -323,7 +323,7 @@ class ScanResults:
             "total_findings": len(self.findings),
             "severity_counts": {
                 s: sum(1 for f in self.findings if f.severity == s)
-                for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")
+                for s in ("KEY", "NOTABLE", "RELEVANT", "LOW", "INFO")
             },
             "findings": [f.to_dict() for f in self.findings],
         }
@@ -403,9 +403,9 @@ def check_sync_services(results: ScanResults):
         if svc_name.lower() in output.lower():
             found_any = True
             state = "running" if "RUNNING" in output else "installed"
-            severity = "CRITICAL" if svc_name in (
+            severity = "KEY" if svc_name in (
                 "ADSync", "Microsoft Azure AD Sync",
-                "Microsoft Entra Connect Sync") else "HIGH"
+                "Microsoft Entra Connect Sync") else "NOTABLE"
             results.add(Finding(
                 "sync_services",
                 f"Cloud sync service detected: {svc_name}",
@@ -465,9 +465,14 @@ def check_sync_services(results: ScanResults):
         if tenant_hint:
             detail += f" Target tenant: {tenant_hint}."
 
+        msol_name = ""
+        m_name = re.search(r'"SamAccountName"\s*:\s*"(MSOL_[^"]+)"', msol_check)
+        if m_name:
+            msol_name = m_name.group(1)
         results.add(Finding(
-            "sync_services", "MSOL sync service account found in AD",
-            detail, severity="CRITICAL", evidence=msol_check[:500],
+            "sync_services",
+            f"MSOL sync service account: {msol_name}" if msol_name else "MSOL sync service account found in AD",
+            detail, severity="KEY", evidence=msol_check[:500],
         ))
     else:
         debug("No MSOL_ service account found in AD (tried ADSI and RSAT).")
@@ -541,7 +546,7 @@ def check_sync_services(results: ScanResults):
             f"The Entra Connect SCP is registered in the AD configuration "
             f"partition, confirming hybrid identity sync is deployed."
             + (f" Cloud tenant: {tenant_from_scp}." if tenant_from_scp else ""),
-            severity="HIGH", evidence=scp_check[:500],
+            severity="NOTABLE", evidence=scp_check[:500],
         ))
     else:
         debug("No Entra Connect SCP found in AD (tried ADSI and RSAT).")
@@ -557,7 +562,7 @@ def check_sync_services(results: ScanResults):
                 "sync_services", "ADSync database found on disk",
                 f"The ADSync database at {db_path} contains encrypted cloud "
                 f"credentials extractable with local admin and AADInternals.",
-                severity="CRITICAL", evidence=f"Path: {db_path}",
+                severity="KEY", evidence=f"Path: {db_path}",
             ))
         else:
             debug(f"ADSync DB not found at {db_path}")
@@ -567,9 +572,9 @@ def check_sync_services(results: ScanResults):
         for svc_name, description in CLOUD_BRIDGE_SERVICES:
             if svc_name.lower() in output.lower():
                 state = "running" if "RUNNING" in output else "installed"
-                severity = ("CRITICAL"
+                severity = ("KEY"
                             if svc_name == "AzureADConnectAuthenticationAgent"
-                            else "HIGH")
+                            else "NOTABLE")
                 results.add(Finding(
                     "cloud_bridge",
                     f"Cloud bridge service: {svc_name}",
@@ -594,7 +599,7 @@ def check_adfs(results: ScanResults):
             "federation", "ADFS server detected",
             "This host runs ADFS. The token-signing certificate can forge "
             "SAML tokens for any federated cloud identity (Golden SAML).",
-            severity="CRITICAL", evidence=adfs_config[:500],
+            severity="KEY", evidence=adfs_config[:500],
         ))
 
         cert_check = run_powershell(
@@ -608,7 +613,7 @@ def check_adfs(results: ScanResults):
                 "federation", "ADFS token-signing certificate accessible",
                 "The token-signing certificate is readable. If the private "
                 "key is exportable, Golden SAML attacks are possible.",
-                severity="CRITICAL", evidence=cert_check[:500],
+                severity="KEY", evidence=cert_check[:500],
             ))
     else:
         debug("No ADFS service found on this host.")
@@ -647,13 +652,13 @@ def check_cloud_dns_integration(results: ScanResults):
 
     dns_checks = [
         (f"enterpriseregistration.{domain}",
-         "Entra device registration (Workplace Join)", "HIGH"),
+         "Entra device registration (Workplace Join)", "NOTABLE"),
         (f"enterpriseenrollment.{domain}",
-         "Intune MDM enrollment", "HIGH"),
+         "Intune MDM enrollment", "NOTABLE"),
         (f"msoid.{domain}",
-         "Microsoft Online ID (O365 client detection)", "MEDIUM"),
+         "Microsoft Online ID (O365 client detection)", "RELEVANT"),
         (f"autodiscover.{domain}",
-         "Exchange Online autodiscovery", "MEDIUM"),
+         "Exchange Online autodiscovery", "RELEVANT"),
         (f"lyncdiscover.{domain}",
          "Teams/Skype for Business federation", "INFO"),
     ]
@@ -700,7 +705,7 @@ def check_outbound_connections(results: ScanResults):
                         "network",
                         f"Active connection to {provider.upper()}: {domain}",
                         f"Outbound connection to {domain} ({ip}) is active.",
-                        severity="MEDIUM", evidence=f"{domain} -> {ip}",
+                        severity="RELEVANT", evidence=f"{domain} -> {ip}",
                     ))
             except socket.gaierror:
                 pass
@@ -736,7 +741,7 @@ def check_environment_variables(results: ScanResults):
                     f"Cloud env var: {var_name}",
                     f"Environment variable {var_name} matches pattern for "
                     f"{label}. Accessible to any process as this user.",
-                    severity="HIGH", evidence=f"{var_name}={var_value}",
+                    severity="NOTABLE", evidence=f"{var_name}={var_value}",
                 ))
                 break
         if matched:
@@ -750,7 +755,7 @@ def check_environment_variables(results: ScanResults):
                     f"Cloud env var: {var_name}",
                     f"Environment variable {var_name} indicates {label} "
                     f"presence on this host.",
-                    severity="MEDIUM", evidence=f"{var_name}={var_value}",
+                    severity="RELEVANT", evidence=f"{var_name}={var_value}",
                 ))
                 break
     if not found:
@@ -847,7 +852,7 @@ def check_credential_files(results: ScanResults, extra_excludes: list[str] = Non
                             "credentials",
                             f"Credential found: {filepath.name}",
                             f"{label} in {filepath}",
-                            severity="HIGH",
+                            severity="NOTABLE",
                             evidence=f"File: {filepath}\n    {matched_lines}",
                         ))
                         break
@@ -863,7 +868,7 @@ def check_credential_files(results: ScanResults, extra_excludes: list[str] = Non
                                 "credentials",
                                 f"Possible credential ref: {filepath.name}",
                                 f"{label} in {filepath}",
-                                severity="MEDIUM",
+                                severity="RELEVANT",
                                 evidence=f"File: {filepath}\n    {matched_lines}",
                             ))
                             break
@@ -897,7 +902,7 @@ def check_aws_profiles(results: ScanResults):
                     "credentials", f"AWS credential file: {aws_path}",
                     f"Contains {len(profiles)} profile(s). "
                     f"{'Static access keys present.' if has_keys else 'No static keys (SSO/role assumption).'}",
-                    severity="HIGH" if has_keys else "MEDIUM",
+                    severity="NOTABLE" if has_keys else "RELEVANT",
                     evidence=f"Profiles: {', '.join(profiles[:5])}",
                 ))
             except (PermissionError, OSError):
@@ -927,7 +932,7 @@ def check_azure_cli(results: ScanResults):
     for az_path in azure_paths:
         if az_path.exists():
             found = True
-            severity = "CRITICAL" if "token" in az_path.name.lower() else "HIGH"
+            severity = "KEY" if "token" in az_path.name.lower() else "NOTABLE"
             try:
                 size = az_path.stat().st_size
                 results.add(Finding(
@@ -952,7 +957,7 @@ def check_scheduled_tasks(results: ScanResults):
                     results.add(Finding(
                         "persistence", "Cron job references cloud credentials",
                         f"A cron entry matches pattern for {label}.",
-                        severity="HIGH", evidence=cron_output[:300],
+                        severity="NOTABLE", evidence=cron_output[:300],
                     ))
         return
 
@@ -982,7 +987,7 @@ def check_scheduled_tasks(results: ScanResults):
                     "persistence",
                     f"Scheduled task references cloud: {task_name}",
                     f"Task \"{task_name}\" contains cloud commands or endpoints.",
-                    severity="MEDIUM", evidence=line[:300],
+                    severity="RELEVANT", evidence=line[:300],
                 ))
                 break
     if not found:
@@ -1019,7 +1024,7 @@ def check_registry_cloud_agents(results: ScanResults):
                 "cloud_agents", f"Cloud agent installed: {agent_name}",
                 f"Registry key for {agent_name} exists. May hold cached "
                 f"credentials or session tokens.",
-                severity="MEDIUM", evidence=f"Key: {reg_path}",
+                severity="RELEVANT", evidence=f"Key: {reg_path}",
             ))
         else:
             debug(f"Registry key not found: {agent_name}")
@@ -1028,9 +1033,9 @@ def check_registry_cloud_agents(results: ScanResults):
     dsregcmd = run_cmd("dsregcmd /status")
     if dsregcmd:
         join_indicators = {
-            "AzureAdJoined : YES": ("Azure AD Joined", "HIGH"),
+            "AzureAdJoined : YES": ("Azure AD Joined", "NOTABLE"),
             "DomainJoined : YES": ("Domain Joined", "INFO"),
-            "WorkplaceJoined : YES": ("Workplace Joined (BYOD)", "MEDIUM"),
+            "WorkplaceJoined : YES": ("Workplace Joined (BYOD)", "RELEVANT"),
         }
         for indicator, (label, severity) in join_indicators.items():
             if indicator in dsregcmd:
@@ -1074,7 +1079,7 @@ def check_conditional_access_indicators(results: ScanResults):
             "Seamless SSO account found (AZUREADSSOACC$)",
             "Seamless SSO is configured. Extracting this account's Kerberos "
             "key enables forging cloud auth tickets for any synced user.",
-            severity="CRITICAL", evidence=sso_check[:300],
+            severity="KEY", evidence=sso_check[:300],
         ))
     else:
         debug("AZUREADSSOACC$ not found in AD (tried ADSI and RSAT).")
@@ -1085,7 +1090,7 @@ def check_conditional_access_indicators(results: ScanResults):
             "credentials", "Primary Refresh Token (PRT) present",
             "This device holds an Entra PRT. Extractable and replayable "
             "to access cloud services, potentially bypassing MFA.",
-            severity="HIGH", evidence="AzureAdPrt : YES",
+            severity="NOTABLE", evidence="AzureAdPrt : YES",
         ))
     else:
         debug("No PRT detected on this device.")
@@ -1126,7 +1131,7 @@ def check_network_shares_for_cloud_scripts(results: ScanResults):
                                     "credentials",
                                     f"Credential on share: {fname}",
                                     f"{label} in {fpath}. Readable by all domain users.",
-                                    severity="CRITICAL",
+                                    severity="KEY",
                                     evidence=f"File: {fpath}\n    {matched_lines}",
                                 ))
                                 break
@@ -1138,7 +1143,7 @@ def check_network_shares_for_cloud_scripts(results: ScanResults):
                                         "credentials",
                                         f"Possible credential ref on share: {fname}",
                                         f"{label} in {fpath}. Readable by all domain users.",
-                                        severity="HIGH",
+                                        severity="NOTABLE",
                                         evidence=f"File: {fpath}\n    {matched_lines}",
                                     ))
                                     break
@@ -1189,7 +1194,12 @@ def print_summary(results: ScanResults):
         for server, role in boundary_servers:
             if server not in seen:
                 seen.add(server)
-                cprint(f"    {server}  —  {role}", Colors.MAGENTA)
+                ip_hint = ""
+                try:
+                    ip_hint = f" ({socket.gethostbyname(server)})"
+                except (socket.gaierror, socket.herror):
+                    ip_hint = " (IP unresolved)"
+                cprint(f"    {server}{ip_hint}  —  {role}", Colors.MAGENTA)
     else:
         print()
         cprint("  Boundary Servers:  none identified on this scan",
@@ -1201,21 +1211,59 @@ def print_summary(results: ScanResults):
     print()
 
     total = report["total_findings"]
-    crits = report["severity_counts"]["CRITICAL"]
-    highs = report["severity_counts"]["HIGH"]
-    meds = report["severity_counts"]["MEDIUM"]
+    keys = report["severity_counts"]["KEY"]
+    notables = report["severity_counts"]["NOTABLE"]
+    relevants = report["severity_counts"]["RELEVANT"]
 
     cprint(f"  Total findings: {total}", Colors.BOLD)
-    if crits:
-        cprint(f"    CRITICAL : {crits}", Colors.RED + Colors.BOLD)
-    if highs:
-        cprint(f"    HIGH     : {highs}", Colors.RED)
-    if meds:
-        cprint(f"    MEDIUM   : {meds}", Colors.YELLOW)
+    if keys:
+        cprint(f"    KEY      : {keys}", Colors.RED + Colors.BOLD)
+    if notables:
+        cprint(f"    NOTABLE  : {notables}", Colors.RED)
+    if relevants:
+        cprint(f"    RELEVANT : {relevants}", Colors.YELLOW)
     if report["severity_counts"]["LOW"]:
         cprint(f"    LOW      : {report['severity_counts']['LOW']}", Colors.CYAN)
     if report["severity_counts"]["INFO"]:
         cprint(f"    INFO     : {report['severity_counts']['INFO']}", Colors.GRAY)
+
+    # Boundary analysis conclusion
+    sync_method = ""
+    sso_method = ""
+    boundary_host = ""
+    attack_paths = []
+    for f in report["findings"]:
+        if "MSOL" in f.get("title", ""):
+            sync_method = "Entra Connect"
+            m_srv = re.search(r"Entra Connect server:\s*(\S+)", f["detail"])
+            if m_srv:
+                boundary_host = m_srv.group(1).rstrip(".")
+        if "AZUREADSSOACC" in f.get("title", ""):
+            sso_method = "Seamless SSO"
+        if "ADFS" in f.get("title", "") and "detected" in f.get("title", ""):
+            if not sync_method:
+                sync_method = "ADFS federation"
+            sso_method = "ADFS"
+    if sync_method:
+        print()
+        domain = report.get("onprem_domain", "")
+        tenant = report.get("cloud_domain", "")
+        line = f"  {domain} syncs to Entra ID via {sync_method}"
+        if boundary_host:
+            line += f" on {boundary_host}"
+        if sso_method:
+            line += f", {sso_method} enabled"
+        cprint(line, Colors.WHITE)
+        if sync_method == "Entra Connect":
+            attack_paths.append("DCSync for MSOL_ account credentials")
+        if sso_method == "Seamless SSO":
+            attack_paths.append("DCSync for AZUREADSSOACC$ Kerberos key")
+        if boundary_host:
+            attack_paths.append(f"Local admin on {boundary_host}")
+        if attack_paths:
+            cprint("  Attack paths:", Colors.BOLD + Colors.YELLOW)
+            for ap in attack_paths:
+                cprint(f"    > {ap}", Colors.YELLOW)
 
     cprint("=" * 70, Colors.BOLD)
     print()
@@ -1331,7 +1379,7 @@ def main():
         cprint(f"  JSON report written to: {report_path}\n", Colors.GREEN)
 
     critical_count = sum(1 for f in results.findings
-                         if f.severity == "CRITICAL")
+                         if f.severity == "KEY")
     return 1 if critical_count > 0 else 0
 
 
