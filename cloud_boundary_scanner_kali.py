@@ -36,6 +36,7 @@ from typing import Any, Optional
 
 class Colors:
     RED = "\033[91m"
+    ORANGE = "\033[38;5;208m"
     YELLOW = "\033[93m"
     GREEN = "\033[92m"
     CYAN = "\033[96m"
@@ -50,7 +51,7 @@ class Colors:
     def severity_color(severity: str) -> str:
         return {
             "KEY": Colors.RED + Colors.BOLD,
-            "NOTABLE": Colors.RED,
+            "NOTABLE": Colors.ORANGE,
             "RELEVANT": Colors.YELLOW,
             "LOW": Colors.CYAN,
             "INFO": Colors.GRAY,
@@ -1149,9 +1150,6 @@ def print_summary(results: ScanResults):
         cprint("  Boundary Servers:  none identified on this scan",
                Colors.GRAY)
 
-    if DEBUG_MODE:
-        cprint(f"  Started:   {report['scan_start']}", Colors.GRAY)
-        cprint(f"  Completed: {report['scan_end']}", Colors.GRAY)
     cprint(f"  Hosts scanned: {len(report['hosts_scanned'])}",
            Colors.WHITE)
     print()
@@ -1165,7 +1163,7 @@ def print_summary(results: ScanResults):
     if keys:
         cprint(f"    KEY      : {keys}", Colors.RED + Colors.BOLD)
     if notables:
-        cprint(f"    NOTABLE  : {notables}", Colors.RED)
+        cprint(f"    NOTABLE  : {notables}", Colors.ORANGE)
     if relevants:
         cprint(f"    RELEVANT : {relevants}", Colors.YELLOW)
     if report["severity_counts"]["LOW"]:
