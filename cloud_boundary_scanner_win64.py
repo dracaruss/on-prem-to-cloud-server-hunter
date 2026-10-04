@@ -7,7 +7,8 @@ Discovers sync services, cached credentials, cloud endpoints, and
 misconfigurations at the hybrid identity boundary.
 
 Usage:
-    python cloud_boundary_scanner_win64.py [--output report.json] [--debug]
+    python cloud_boundary_scanner_win64.py [--output report.json] [--silent]
+    python cloud_boundary_scanner_win64.py -dc 10.0.0.2 [--output report.json]
 
 Requirements:
     - Run from a domain-joined Windows host (ideally with local admin)
@@ -72,11 +73,11 @@ def cprint(text: str, color: str = "", end: str = "\n"):
 # Debug logging (only prints when --debug is set)
 # ---------------------------------------------------------------------------
 
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 
 def debug(msg: str):
-    """Print a debug message only when --debug is active."""
+    """Print a debug message (suppressed by --silent)."""
     if DEBUG_MODE:
         cprint(f"  [DBG] {msg}", Colors.GRAY)
 
@@ -194,6 +195,15 @@ SYNC_SERVICES = [
     ("AzureADConnectAgentUpdater", "Entra Connect agent auto-updater"),
 ]
 
+CLOUD_BRIDGE_SERVICES = [
+    ("himds", "Azure Arc Hybrid Instance Metadata Service"),
+    ("GCArcService", "Azure Arc Guest Configuration agent"),
+    ("ExtensionService", "Azure Arc Extension Service"),
+    ("Microsoft AAD App Proxy Connector", "Entra Application Proxy Connector"),
+    ("WAPCSvc", "Web Application Proxy Service (ADFS/App Proxy)"),
+    ("AzureADConnectAuthenticationAgent", "Entra Pass-through Authentication agent"),
+]
+
 CONFIG_EXTENSIONS = {
     ".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".vbs",
     ".py", ".rb", ".config", ".xml", ".json", ".yaml",
@@ -207,6 +217,11 @@ DEFAULT_EXCLUDE_DIRS = {
     "node_modules", ".git", ".tox", "dist-packages", "lib-python",
     "SelfTest", ".mypy_cache", ".pytest_cache",
 }
+
+# Remote DC targeting (set by -dc flag in main())
+DC_TARGET = ""
+DC_BASE_DN = ""
+DC_CONFIG_NC = ""
 
 # ---------------------------------------------------------------------------
 # Finding / Results
@@ -339,6 +354,28 @@ def is_windows() -> bool:
 # Scanner modules
 # ---------------------------------------------------------------------------
 
+def _adsi_searcher(base_dn_override: str = "") -> str:
+    """Return PowerShell to create a DirectorySearcher, targeting remote DC if set."""
+    if DC_TARGET:
+        base = base_dn_override or DC_BASE_DN
+        return (f"$s = New-Object DirectoryServices.DirectorySearcher("
+                f"[ADSI]'LDAP://{DC_TARGET}/{base}');")
+    return "$s = New-Object DirectoryServices.DirectorySearcher;"
+
+
+def _rsat_server() -> str:
+    """Return -Server parameter string for RSAT cmdlets when targeting a remote DC."""
+    if DC_TARGET:
+        return f"-Server {DC_TARGET} "
+    return ""
+
+
+def _domain_from_base_dn(base_dn: str) -> str:
+    """Convert 'DC=corp,DC=local' to 'corp.local'."""
+    parts = re.findall(r"DC=([^,]+)", base_dn, re.IGNORECASE)
+    return ".".join(parts) if parts else ""
+
+
 def check_sync_services(results: ScanResults):
     status("Checking cloud sync services...")
 
@@ -370,7 +407,7 @@ def check_sync_services(results: ScanResults):
     # MSOL_ account — try ADSI first (works without RSAT), then RSAT cmdlet
     debug("Querying AD for MSOL_ sync account (ADSI)...")
     msol_check = run_powershell(
-        "$s = New-Object DirectoryServices.DirectorySearcher;"
+        _adsi_searcher() +
         "$s.Filter = '(&(objectCategory=person)(objectClass=user)"
         "(samAccountName=MSOL_*))';"
         "$s.PropertiesToLoad.AddRange(@('samaccountname','description'));"
@@ -385,7 +422,8 @@ def check_sync_services(results: ScanResults):
     if not msol_check or "MSOL_" not in msol_check:
         debug("ADSI MSOL_ query returned nothing, trying RSAT Get-ADUser...")
         msol_check = run_powershell(
-            "Get-ADUser -Filter {SamAccountName -like 'MSOL_*'} "
+            f"Get-ADUser {_rsat_server()}"
+            "-Filter {SamAccountName -like 'MSOL_*'} "
             "-Properties Description "
             "| Select-Object SamAccountName, Enabled, Description "
             "| ConvertTo-Json")
@@ -401,6 +439,8 @@ def check_sync_services(results: ScanResults):
         m_ten = re.search(r"synchronize to tenant\s+(\S+)", msol_check, re.IGNORECASE)
         if m_ten:
             tenant_hint = m_ten.group(1).rstrip(".")
+            if tenant_hint and not results.cloud_domain:
+                results.cloud_domain = tenant_hint
 
         detail = (
             "The MSOL_ account is the Entra Connect directory sync account. "
@@ -421,27 +461,49 @@ def check_sync_services(results: ScanResults):
 
     # Entra Connect Service Connection Point — try ADSI first, then RSAT
     debug("Querying AD for Entra Connect SCP (ADSI)...")
-    scp_check = run_powershell(
-        "$root = [ADSI]'LDAP://RootDSE';"
-        "$configNC = $root.configurationNamingContext;"
-        "$s = New-Object DirectoryServices.DirectorySearcher;"
-        "$s.SearchRoot = [ADSI]\\\"LDAP://CN=Device Registration Configuration,"
-        "CN=Services,$configNC\\\";"
-        "$s.Filter = '(objectClass=serviceConnectionPoint)';"
-        "$s.PropertiesToLoad.AddRange(@('keywords','distinguishedname'));"
-        "$r = $s.FindAll();"
-        "foreach($e in $r){"
-        "  $p = $e.Properties;"
-        "  [PSCustomObject]@{"
-        "    DN=$p['distinguishedname'][0];"
-        "    Keywords=($p['keywords'] -join ',')"
-        "  }"
-        "} | ConvertTo-Json")
+    if DC_TARGET and DC_CONFIG_NC:
+        scp_base = (f"CN=Device Registration Configuration,"
+                    f"CN=Services,{DC_CONFIG_NC}")
+        scp_check = run_powershell(
+            f"$s = New-Object DirectoryServices.DirectorySearcher("
+            f"[ADSI]'LDAP://{DC_TARGET}/{scp_base}');"
+            "$s.Filter = '(objectClass=serviceConnectionPoint)';"
+            "$s.PropertiesToLoad.AddRange(@('keywords','distinguishedname'));"
+            "$r = $s.FindAll();"
+            "foreach($e in $r){"
+            "  $p = $e.Properties;"
+            "  [PSCustomObject]@{"
+            "    DN=$p['distinguishedname'][0];"
+            "    Keywords=($p['keywords'] -join ',')"
+            "  }"
+            "} | ConvertTo-Json")
+    else:
+        scp_check = run_powershell(
+            "$root = [ADSI]'LDAP://RootDSE';"
+            "$configNC = $root.configurationNamingContext;"
+            "$s = New-Object DirectoryServices.DirectorySearcher;"
+            "$s.SearchRoot = [ADSI]\\\"LDAP://CN=Device Registration Configuration,"
+            "CN=Services,$configNC\\\";"
+            "$s.Filter = '(objectClass=serviceConnectionPoint)';"
+            "$s.PropertiesToLoad.AddRange(@('keywords','distinguishedname'));"
+            "$r = $s.FindAll();"
+            "foreach($e in $r){"
+            "  $p = $e.Properties;"
+            "  [PSCustomObject]@{"
+            "    DN=$p['distinguishedname'][0];"
+            "    Keywords=($p['keywords'] -join ',')"
+            "  }"
+            "} | ConvertTo-Json")
     if not scp_check or "azureAD" not in scp_check.lower():
         debug("ADSI SCP query returned nothing, trying RSAT Get-ADObject...")
+        if DC_TARGET and DC_CONFIG_NC:
+            _configNC_ps = f"$configNC = '{DC_CONFIG_NC}';"
+        else:
+            _configNC_ps = "$configNC = (Get-ADRootDSE).configurationNamingContext;"
         scp_check = run_powershell(
-            "$configNC = (Get-ADRootDSE).configurationNamingContext; "
-            "Get-ADObject -SearchBase \\\"CN=Device Registration Configuration,"
+            f"{_configNC_ps} "
+            f"Get-ADObject {_rsat_server()}"
+            "-SearchBase \\\"CN=Device Registration Configuration,"
             "CN=Services,$configNC\\\" "
             "-Filter {objectClass -eq 'serviceConnectionPoint'} "
             "-Properties keywords "
@@ -479,6 +541,22 @@ def check_sync_services(results: ScanResults):
             ))
         else:
             debug(f"ADSync DB not found at {db_path}")
+
+    # Cloud bridge services (Arc, App Proxy, PTA)
+    if output:  # reuse the sc query output from above
+        for svc_name, description in CLOUD_BRIDGE_SERVICES:
+            if svc_name.lower() in output.lower():
+                state = "running" if "RUNNING" in output else "installed"
+                severity = ("CRITICAL"
+                            if svc_name == "AzureADConnectAuthenticationAgent"
+                            else "HIGH")
+                results.add(Finding(
+                    "cloud_bridge",
+                    f"Cloud bridge service: {svc_name}",
+                    f"{description} is {state} on this host. "
+                    f"This service extends cloud management to on-prem.",
+                    severity=severity, evidence=f"Service: {svc_name}",
+                ))
 
 
 def check_adfs(results: ScanResults):
@@ -536,6 +614,50 @@ def check_cloud_dns(results: ScanResults):
                 severity="INFO",
                 evidence="\n".join(reachable[:6]),
             ))
+
+
+def check_cloud_dns_integration(results: ScanResults):
+    """Check for DNS records indicating cloud identity integration."""
+    domain = results.onprem_domain
+    if not domain or domain == "WORKGROUP":
+        debug("No domain name available for DNS integration checks.")
+        return
+
+    status(f"Checking cloud integration DNS records for {domain}...")
+
+    dns_checks = [
+        (f"enterpriseregistration.{domain}",
+         "Entra device registration (Workplace Join)", "HIGH"),
+        (f"enterpriseenrollment.{domain}",
+         "Intune MDM enrollment", "HIGH"),
+        (f"msoid.{domain}",
+         "Microsoft Online ID (O365 client detection)", "MEDIUM"),
+        (f"autodiscover.{domain}",
+         "Exchange Online autodiscovery", "MEDIUM"),
+        (f"lyncdiscover.{domain}",
+         "Teams/Skype for Business federation", "INFO"),
+    ]
+
+    found_any = False
+    for hostname, description, severity in dns_checks:
+        try:
+            addr = socket.gethostbyname(hostname)
+            found_any = True
+            results.add(Finding(
+                "dns_integration",
+                f"Cloud DNS: {hostname}",
+                f"{hostname} resolves to {addr}. "
+                f"This confirms {description} is configured, "
+                f"indicating cloud identity integration.",
+                severity=severity,
+                evidence=f"{hostname} -> {addr}",
+            ))
+            debug(f"Cloud DNS integration: {hostname} -> {addr}")
+        except socket.gaierror:
+            debug(f"Cloud DNS not found: {hostname}")
+
+    if not found_any:
+        debug(f"No cloud integration DNS records found for {domain}.")
 
 
 def check_outbound_connections(results: ScanResults):
@@ -861,6 +983,14 @@ def check_registry_cloud_agents(results: ScanResults):
         (r"HKLM\SOFTWARE\Google\CloudOpsAgent", "GCP Ops Agent"),
         (r"HKLM\SOFTWARE\Microsoft\Intune", "Microsoft Intune"),
         (r"HKLM\SOFTWARE\Microsoft\OneDrive", "OneDrive (cloud sync)"),
+        (r"HKLM\SOFTWARE\Microsoft\Azure Connected Machine Agent",
+         "Azure Arc Connected Machine agent"),
+        (r"HKLM\SOFTWARE\Microsoft\Microsoft AAD App Proxy Connector",
+         "Entra Application Proxy Connector"),
+        (r"HKLM\SOFTWARE\Microsoft\AzureADPrivateNetwork",
+         "Entra Private Access / App Proxy network"),
+        (r"HKLM\SOFTWARE\Microsoft\PassthroughAuthentication",
+         "Entra Pass-through Authentication"),
     ]
     for reg_path, agent_name in registry_checks:
         output = run_cmd(f'reg query "{reg_path}" 2>nul')
@@ -899,7 +1029,7 @@ def check_conditional_access_indicators(results: ScanResults):
     # Try ADSI first (works without RSAT), then RSAT cmdlet
     debug("Querying AD for AZUREADSSOACC$ Seamless SSO account (ADSI)...")
     sso_check = run_powershell(
-        "$s = New-Object DirectoryServices.DirectorySearcher;"
+        _adsi_searcher() +
         "$s.Filter = '(&(objectCategory=computer)"
         "(samAccountName=AZUREADSSOACC$))';"
         "$s.PropertiesToLoad.AddRange(@('samaccountname','dnshostname'));"
@@ -914,7 +1044,8 @@ def check_conditional_access_indicators(results: ScanResults):
     if not sso_check or "AZUREADSSOACC" not in sso_check:
         debug("ADSI SSO query returned nothing, trying RSAT Get-ADComputer...")
         sso_check = run_powershell(
-            "Get-ADComputer -Filter {SamAccountName -eq 'AZUREADSSOACC$'} "
+            f"Get-ADComputer {_rsat_server()}"
+            "-Filter {SamAccountName -eq 'AZUREADSSOACC$'} "
             "| Select-Object SamAccountName, Enabled | ConvertTo-Json")
     if sso_check and "AZUREADSSOACC" in sso_check:
         debug(f"AZUREADSSOACC$ found: {sso_check[:200]}")
@@ -1013,17 +1144,22 @@ def print_summary(results: ScanResults):
     if report.get("cloud_domain"):
         cprint(f"  Cloud Tenant:    {report['cloud_domain']}", Colors.WHITE)
     cprint(f"  On-prem Domain:  {report['onprem_domain']}", Colors.WHITE)
+    if DC_TARGET:
+        cprint(f"  Remote DC:       {DC_TARGET}", Colors.WHITE)
 
     # Surface discovered boundary servers from findings
     boundary_servers = []
     for f in report["findings"]:
-        if f["category"] in ("sync_services", "federation"):
+        if f["category"] in ("sync_services", "federation", "cloud_bridge"):
             # Extract server name from detail text
             m = re.search(r"Entra Connect server:\s*(\S+)", f["detail"])
             if m:
                 boundary_servers.append(
                     (m.group(1).rstrip("."), f["title"]))
             elif "ADFS server detected" in f["title"]:
+                boundary_servers.append(
+                    (report["hostname"], f["title"]))
+            elif f["category"] == "cloud_bridge":
                 boundary_servers.append(
                     (report["hostname"], f["title"]))
     if boundary_servers:
@@ -1070,14 +1206,21 @@ def print_summary(results: ScanResults):
 # ---------------------------------------------------------------------------
 
 def main():
-    global DEBUG_MODE
+    global DEBUG_MODE, DC_TARGET, DC_BASE_DN, DC_CONFIG_NC
 
     parser = argparse.ArgumentParser(
         description="Cloud Boundary Scanner (Windows)")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="Write JSON report to file.")
+    parser.add_argument("-dc", type=str, default="",
+                        help="Target a remote domain controller by IP. "
+                             "Queries that DC's domain for sync objects "
+                             "instead of the local domain.")
+    parser.add_argument("--silent", action="store_true",
+                        help="Reduce output (suppress debug/negative results).")
     parser.add_argument("--debug", action="store_true",
-                        help="Show all debug output including negative results.")
+                        help="(Default behavior) Verbose output. Kept for "
+                             "backward compatibility.")
     parser.add_argument("--exclude-path", action="append", default=[],
                         metavar="DIR",
                         help="Additional directory names to skip during file "
@@ -1085,7 +1228,8 @@ def main():
                              "node_modules etc. are excluded by default.")
     args = parser.parse_args()
 
-    DEBUG_MODE = args.debug
+    # Verbose is now the default; --silent suppresses debug output
+    DEBUG_MODE = not args.silent
 
     # Enable ANSI color support on Windows terminals before any output.
     # Without this, the first lines print raw escape codes (?[1m?[96m).
@@ -1097,8 +1241,33 @@ def main():
 
     results = ScanResults()
 
+    # Resolve remote DC if specified
+    if args.dc:
+        DC_TARGET = args.dc
+        status(f"Resolving base DN from remote DC {DC_TARGET}...")
+        rootdse_out = run_powershell(
+            f"$r = [ADSI]'LDAP://{DC_TARGET}/RootDSE'; "
+            f"$r.defaultNamingContext[0] + '|' + "
+            f"$r.configurationNamingContext[0]")
+        if rootdse_out and "|" in rootdse_out:
+            parts = rootdse_out.strip().split("|", 1)
+            DC_BASE_DN = parts[0].strip()
+            DC_CONFIG_NC = parts[1].strip()
+            debug(f"Remote DC base DN: {DC_BASE_DN}")
+            debug(f"Remote DC config NC: {DC_CONFIG_NC}")
+            domain_from_dn = _domain_from_base_dn(DC_BASE_DN)
+            if domain_from_dn:
+                results.onprem_domain = domain_from_dn
+                cprint(f"  Remote domain: {domain_from_dn}", Colors.WHITE)
+        else:
+            cprint(f"  [!] Could not resolve base DN from {DC_TARGET}. "
+                   "AD queries will target this DC but may fail.",
+                   Colors.YELLOW)
+        print()
+
     modules = [
         check_sync_services, check_adfs, check_cloud_dns,
+        check_cloud_dns_integration,
         check_outbound_connections, check_environment_variables,
         lambda r: check_credential_files(r, extra_excludes=args.exclude_path),
         check_aws_profiles, check_azure_cli,

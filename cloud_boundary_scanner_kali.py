@@ -68,7 +68,7 @@ def cprint(text: str, color: str = "", end: str = "\n"):
     print(Colors.strip_if_no_tty(msg), end=end)
 
 
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 
 def debug(msg: str):
@@ -130,7 +130,21 @@ CLOUD_DOMAINS = {
 SYNC_SERVICE_NAMES = [
     "ADSync", "AzureADConnectHealthSyncInsights",
     "AADConnectProvisioningAgent", "AzureADConnectAgentUpdater", "adfssrv",
+    # Cloud bridge services
+    "himds", "GCArcService", "ExtensionService",
+    "Microsoft AAD App Proxy Connector", "WAPCSvc",
+    "AzureADConnectAuthenticationAgent",
 ]
+
+# Descriptions for cloud bridge services (used for finding output)
+CLOUD_BRIDGE_SERVICES = {
+    "himds": ("Azure Arc Hybrid Instance Metadata Service", "HIGH"),
+    "GCArcService": ("Azure Arc Guest Configuration agent", "HIGH"),
+    "ExtensionService": ("Azure Arc Extension Service", "MEDIUM"),
+    "Microsoft AAD App Proxy Connector": ("Entra Application Proxy Connector", "HIGH"),
+    "WAPCSvc": ("Web Application Proxy Service (ADFS/App Proxy)", "HIGH"),
+    "AzureADConnectAuthenticationAgent": ("Entra Pass-through Authentication agent", "CRITICAL"),
+}
 
 # Tier 1 (HIGH): patterns that match actual credential VALUES or exportable secrets
 CREDENTIAL_PATTERNS = [
@@ -708,15 +722,23 @@ def check_remote_services(target: str, creds: Credentials,
                 state_str = {1: "stopped", 2: "starting",
                              3: "stopping", 4: "running"}.get(
                     state, f"unknown({state})")
-                severity = ("CRITICAL" if svc_name in ("ADSync", "adfssrv")
-                            else "HIGH")
+                if svc_name in CLOUD_BRIDGE_SERVICES:
+                    bridge_desc, severity = CLOUD_BRIDGE_SERVICES[svc_name]
+                    category = "cloud_bridge"
+                    detail_msg = (f"{bridge_desc} is {state_str}. "
+                                  f"Cloud bridge on {target}.")
+                else:
+                    severity = ("CRITICAL" if svc_name in ("ADSync", "adfssrv")
+                                else "HIGH")
+                    category = "sync_services"
+                    detail_msg = (f"Service is {state_str}. This is a Tier 0 "
+                                  f"cloud boundary server."
+                                  f" Entra Connect server: {target}.")
                 debug(f"Service found on {target}: {svc_name} ({state_str})")
                 results.add(Finding(
-                    "sync_services",
+                    category,
                     f"Cloud service on {target}: {svc_name} ({state_str})",
-                    f"Service is {state_str}. This is a Tier 0 cloud "
-                    f"boundary server."
-                    f" Entra Connect server: {target}.",
+                    detail_msg,
                     severity=severity, host=target,
                     evidence=f"Service: {svc_name}, State: {state_str}",
                 ))
@@ -743,6 +765,14 @@ def check_remote_registry(target: str, creds: Credentials,
         ("HKLM", "SOFTWARE\\Amazon\\SSMAgent", "AWS SSM Agent"),
         ("HKLM", "SOFTWARE\\Google\\CloudOpsAgent", "GCP Ops Agent"),
         ("HKLM", "SOFTWARE\\Microsoft\\Intune", "Microsoft Intune"),
+        ("HKLM", "SOFTWARE\\Microsoft\\Azure Connected Machine Agent",
+         "Azure Arc Connected Machine agent"),
+        ("HKLM", "SOFTWARE\\Microsoft\\Microsoft AAD App Proxy Connector",
+         "Entra Application Proxy Connector"),
+        ("HKLM", "SOFTWARE\\Microsoft\\AzureADPrivateNetwork",
+         "Entra Private Access / App Proxy network"),
+        ("HKLM", "SOFTWARE\\Microsoft\\PassthroughAuthentication",
+         "Entra Pass-through Authentication"),
     ]
     try:
         string_binding = f"ncacn_np:{target}[\\pipe\\winreg]"
@@ -939,6 +969,74 @@ def check_cloud_dns(results: ScanResults):
             ))
 
 
+def check_cloud_dns_integration(results: ScanResults, domain: str):
+    """Check for DNS records indicating cloud identity integration."""
+    if not domain:
+        debug("No domain name available for DNS integration checks.")
+        return
+
+    status(f"Checking cloud integration DNS records for {domain}...")
+
+    dns_checks = [
+        (f"enterpriseregistration.{domain}",
+         "Entra device registration (Workplace Join)", "HIGH"),
+        (f"enterpriseenrollment.{domain}",
+         "Intune MDM enrollment", "HIGH"),
+        (f"msoid.{domain}",
+         "Microsoft Online ID (O365 client detection)", "MEDIUM"),
+        (f"autodiscover.{domain}",
+         "Exchange Online autodiscovery", "MEDIUM"),
+        (f"lyncdiscover.{domain}",
+         "Teams/Skype for Business federation", "INFO"),
+    ]
+
+    found_any = False
+    for hostname, description, severity in dns_checks:
+        try:
+            cname_target = ""
+            addr = ""
+            # Try CNAME resolution with dnspython
+            if HAS_DNS:
+                try:
+                    answers = dns.resolver.resolve(hostname, "CNAME")
+                    for rdata in answers:
+                        cname_target = str(rdata.target).rstrip(".")
+                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+                        dns.resolver.NoNameservers, Exception):
+                    pass
+                try:
+                    answers = dns.resolver.resolve(hostname, "A")
+                    addr = str(answers[0])
+                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
+                        dns.resolver.NoNameservers, Exception):
+                    pass
+
+            # Fallback to socket
+            if not addr:
+                addr = socket.gethostbyname(hostname)
+
+            found_any = True
+            detail = (f"{hostname} resolves to {addr}. ")
+            if cname_target:
+                detail += f"CNAME target: {cname_target}. "
+            detail += (f"This confirms {description} is configured, "
+                       f"indicating cloud identity integration.")
+
+            results.add(Finding(
+                "dns_integration",
+                f"Cloud DNS: {hostname}",
+                detail, severity=severity,
+                evidence=f"{hostname} -> {cname_target or addr}",
+            ))
+            debug(f"Cloud DNS integration: {hostname} -> "
+                  f"{cname_target or addr}")
+        except (socket.gaierror, Exception):
+            debug(f"Cloud DNS not found: {hostname}")
+
+    if not found_any:
+        debug(f"No cloud integration DNS records found for {domain}.")
+
+
 def check_adfs_metadata(dc_ip: str, creds: Credentials,
                         results: ScanResults):
     status("Probing for ADFS federation endpoints...")
@@ -1017,7 +1115,7 @@ def print_summary(results: ScanResults):
     # Surface discovered boundary servers from findings
     boundary_servers = []
     for f in report["findings"]:
-        if f["category"] in ("sync_services", "federation"):
+        if f["category"] in ("sync_services", "federation", "cloud_bridge"):
             # Extract server name from detail text
             m = re.search(r"Entra Connect server:\s*(\S+)", f["detail"])
             if m:
@@ -1028,6 +1126,9 @@ def print_summary(results: ScanResults):
                 if m_host:
                     boundary_servers.append(
                         (m_host.group(1).rstrip("."), f["title"]))
+            elif f["category"] == "cloud_bridge":
+                boundary_servers.append(
+                    (f.get("host", "unknown"), f["title"]))
     if boundary_servers:
         print()
         cprint("  Boundary Servers Identified:",
@@ -1111,9 +1212,11 @@ Examples:
                         help="Target IP or CIDR subnet (default: DC only)")
     parser.add_argument("-o", "--output", default=None,
                         help="Write JSON report to file")
+    parser.add_argument("--silent", action="store_true",
+                        help="Reduce output (suppress debug/negative results)")
     parser.add_argument("--debug", action="store_true",
-                        help="Show all debug output including negative "
-                             "results")
+                        help="(Default behavior) Verbose output. Kept for "
+                             "backward compatibility.")
     parser.add_argument("--threads", type=int, default=10,
                         help="Max threads for host scanning (default: 10)")
     parser.add_argument("--skip-shares", action="store_true",
@@ -1122,7 +1225,8 @@ Examples:
                         help="Max files to scan per share (default: 500)")
     args = parser.parse_args()
 
-    DEBUG_MODE = args.debug
+    # Verbose is now the default; --silent suppresses debug output
+    DEBUG_MODE = not args.silent
 
     # Validate dependencies
     missing = []
@@ -1163,6 +1267,7 @@ Examples:
     cprint("  [Phase 2] DNS and federation endpoint discovery",
            Colors.BOLD + Colors.MAGENTA)
     check_cloud_dns(results)
+    check_cloud_dns_integration(results, creds.domain)
     check_adfs_metadata(args.dc_ip, creds, results)
 
     # Phase 3: Remote hosts
