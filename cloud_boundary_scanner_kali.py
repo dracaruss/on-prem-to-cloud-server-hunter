@@ -111,13 +111,20 @@ except ImportError:
 CLOUD_DOMAINS = {
     "azure": [
         "login.microsoftonline.com", "graph.microsoft.com",
-        "management.azure.com", "aadconnecthealth.azure.com",
-        "adminwebservice.microsoftonline.com",
-        "provisioningapi.microsoftonline.com",
-        "autologon.microsoftazuread-sso.com",
+        "management.azure.com", "portal.azure.com",
+        "aadconnecthealth.azure.com", "adminwebservice.microsoftonline.com",
+        "login.windows.net", "provisioningapi.microsoftonline.com",
+        "graph.windows.net", "autologon.microsoftazuread-sso.com",
+        "enterpriseregistration.windows.net", "pas.windows.net",
     ],
-    "aws": ["sts.amazonaws.com", "signin.aws.amazon.com"],
-    "gcp": ["accounts.google.com", "oauth2.googleapis.com"],
+    "aws": [
+        "sts.amazonaws.com", "signin.aws.amazon.com",
+        "sso.amazonaws.com", "console.aws.amazon.com",
+    ],
+    "gcp": [
+        "accounts.google.com", "oauth2.googleapis.com",
+        "cloudresourcemanager.googleapis.com", "iam.googleapis.com",
+    ],
 }
 
 SYNC_SERVICE_NAMES = [
@@ -125,22 +132,53 @@ SYNC_SERVICE_NAMES = [
     "AADConnectProvisioningAgent", "AzureADConnectAgentUpdater", "adfssrv",
 ]
 
+# Tier 1 (HIGH): patterns that match actual credential VALUES or exportable secrets
 CREDENTIAL_PATTERNS = [
-    (r"(?i)AZURE[_\-]?(?:CLIENT|TENANT|SUBSCRIPTION)[_\-]?(?:ID|SECRET)", "Azure credential variable"),
-    (r"(?i)AZURE[_\-]?(?:STORAGE|ACCOUNT)[_\-]?KEY", "Azure storage key"),
-    (r"(?i)SharedAccessSignature=", "Azure SAS token"),
-    (r"(?i)DefaultEndpointsProtocol=https;AccountName=", "Azure connection string"),
-    (r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}", "AWS access key ID"),
-    (r"(?i)aws_secret_access_key\s*=", "AWS secret key assignment"),
-    (r'"type"\s*:\s*"service_account"', "GCP service account JSON key"),
-    (r"(?i)(?:api[_\-]?key|apikey|secret[_\-]?key|access[_\-]?token)\s*[:=]", "Generic API key or token"),
-    (r"(?i)-----BEGIN (?:RSA )?PRIVATE KEY-----", "Private key (PEM)"),
+    (r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}",
+     "AWS access key ID"),
+    (r"(?i)aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{20,}",
+     "AWS secret access key"),
+    (r"(?i)aws_session_token\s*=\s*\S{20,}",
+     "AWS session token"),
+    (r"(?i)SharedAccessSignature=sv=[^\s&\"']{20,}",
+     "Azure SAS token"),
+    (r"(?i)DefaultEndpointsProtocol=https;AccountName=[^;\"']+;AccountKey=[^;\"']+",
+     "Azure storage connection string"),
+    (r"(?i)AccountKey=[A-Za-z0-9/+=]{80,}",
+     "Azure storage account key"),
+    (r'"type"\s*:\s*"service_account"',
+     "GCP service account JSON key"),
+    (r"(?i)-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+     "Private key (PEM)"),
+]
+
+# Tier 2 (MEDIUM): credential-adjacent patterns, variable names with values assigned
+CREDENTIAL_REF_PATTERNS = [
+    (r"(?i)AZURE[_\-]?(?:CLIENT|TENANT|SUBSCRIPTION)[_\-]?(?:ID|SECRET)\s*[:=]\s*\S+",
+     "Azure credential variable with value"),
+    (r"(?i)AZURE[_\-]?(?:STORAGE|ACCOUNT)[_\-]?KEY\s*[:=]\s*\S+",
+     "Azure storage key variable"),
+    (r"(?i)(?:client[_\-]?secret|client[_\-]?key)\s*[:=]\s*[\"'][^\"']{16,}[\"']",
+     "Client secret or key"),
+    (r"(?i)(?:api[_\-]?key|secret[_\-]?key|access[_\-]?token)\s*[:=]\s*[\"'][^\"']{16,}[\"']",
+     "API key or token with value"),
+    (r"(?i)GOOGLE_APPLICATION_CREDENTIALS\s*[:=]\s*\S+",
+     "GCP credentials path"),
     (r"(?i)Connect-AzAccount", "Azure PowerShell login"),
     (r"(?i)Connect-MsolService", "MSOnline PowerShell login"),
     (r"(?i)Connect-AzureAD", "AzureAD PowerShell login"),
     (r"(?i)Set-Msoluser", "MSOnline user modification"),
     (r"(?i)azcopy", "AzCopy cloud transfer tool"),
 ]
+
+SCANNER_FILENAME = "cloud_boundary_scanner"  # exclude self from results
+
+# Directories to skip during share scanning (dev/tool artifacts, not real creds)
+DEFAULT_EXCLUDE_DIRS = {
+    ".venv", "venv", "env", ".env", "__pycache__", "site-packages",
+    "node_modules", ".git", ".tox", "dist-packages", "lib-python",
+    "SelfTest", ".mypy_cache", ".pytest_cache",
+}
 
 SHARE_SCAN_EXTENSIONS = {
     ".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".vbs",
@@ -178,10 +216,12 @@ class Finding:
 
 
 class ScanResults:
-    def __init__(self):
+    def __init__(self, onprem_domain: str = "", cloud_domain: str = ""):
         self.findings: list[Finding] = []
         self.scan_start = datetime.utcnow().isoformat()
         self.hosts_scanned: list[str] = []
+        self.onprem_domain = onprem_domain
+        self.cloud_domain = cloud_domain
 
     def add(self, finding: Finding):
         self.findings.append(finding)
@@ -189,6 +229,10 @@ class ScanResults:
         host_tag = f" [{finding.host}]" if finding.host else ""
         if finding.severity in ("CRITICAL", "HIGH", "MEDIUM"):
             cprint(f"  [+] [{finding.severity}]{host_tag} {finding.title}", color)
+            # Show evidence inline for credential findings so values are visible
+            if finding.evidence and finding.category == "credentials":
+                for eline in finding.evidence.splitlines():
+                    cprint(f"      {eline.strip()}", Colors.DIM)
         elif DEBUG_MODE:
             cprint(f"  [.] [{finding.severity}]{host_tag} {finding.title}", color)
 
@@ -196,6 +240,8 @@ class ScanResults:
         return {
             "scan_start": self.scan_start,
             "scan_end": datetime.utcnow().isoformat(),
+            "onprem_domain": self.onprem_domain,
+            "cloud_domain": self.cloud_domain,
             "hosts_scanned": self.hosts_scanned,
             "total_findings": len(self.findings),
             "severity_counts": {
@@ -338,43 +384,117 @@ def enumerate_ad_cloud_objects(conn: ldap3.Connection,
 
     debug(f"Base DN: {base_dn}")
 
-    # MSOL_ sync account
+    # --- MSOL_ sync account ---
     status("Querying AD for MSOL_ sync account...")
     conn.search(base_dn, "(sAMAccountName=MSOL_*)", SUBTREE,
                 attributes=["sAMAccountName", "description", "whenCreated",
                              "userAccountControl", "distinguishedName"])
     if conn.entries:
         for entry in conn.entries:
+            desc = str(entry.description) if hasattr(entry, "description") else ""
+            debug(f"MSOL_ account found: {entry.sAMAccountName}, "
+                  f"Description: {desc[:200]}")
+
+            # Parse description for boundary server and tenant
+            # Format: "...running on computer [HOSTNAME] configured to
+            # synchronize to tenant [TENANT]..."
+            server_hint = ""
+            tenant_hint = ""
+            m_srv = re.search(r"running on computer\s+(\S+)",
+                              desc, re.IGNORECASE)
+            if m_srv:
+                server_hint = m_srv.group(1).rstrip(".")
+            m_ten = re.search(r"synchronize to tenant\s+(\S+)",
+                              desc, re.IGNORECASE)
+            if m_ten:
+                tenant_hint = m_ten.group(1).rstrip(".")
+                if not results.cloud_domain:
+                    results.cloud_domain = tenant_hint
+
+            detail = (
+                "The MSOL_ account is the Entra Connect directory sync "
+                "account. It holds DCSync-equivalent privileges on-prem "
+                "and write access in the Entra tenant."
+            )
+            if server_hint:
+                detail += f" Entra Connect server: {server_hint}."
+            if tenant_hint:
+                detail += f" Target tenant: {tenant_hint}."
+
             results.add(Finding(
                 "sync_services",
                 f"MSOL sync account: {entry.sAMAccountName}",
-                "Entra Connect sync account with DCSync privileges on-prem "
-                "and write access in the cloud tenant.",
-                severity="CRITICAL", host=dc_ip,
-                evidence=f"DN: {entry.distinguishedName}, Created: {entry.whenCreated}",
+                detail, severity="CRITICAL", host=dc_ip,
+                evidence=(f"DN: {entry.distinguishedName}, "
+                          f"Description: {desc[:300]}"),
             ))
     else:
         debug("No MSOL_ sync account found.")
 
-    # AZUREADSSOACC$ (Seamless SSO)
+    # --- Entra Connect Service Connection Point (SCP) ---
+    status("Querying AD for Entra Connect SCP...")
+    config_nc = conn.server.info.other.get(
+        "configurationNamingContext", [None])[0]
+    if config_nc:
+        scp_base = (f"CN=Device Registration Configuration,"
+                    f"CN=Services,{config_nc}")
+        try:
+            conn.search(scp_base,
+                        "(objectClass=serviceConnectionPoint)", SUBTREE,
+                        attributes=["keywords", "distinguishedName"])
+            if conn.entries:
+                for entry in conn.entries:
+                    keywords = (str(entry.keywords)
+                                if hasattr(entry, "keywords") else "")
+                    debug(f"Entra Connect SCP found: {keywords[:200]}")
+                    tenant_from_scp = ""
+                    m_ad = re.search(r"azureADName[:\s]+(\S+)",
+                                     keywords, re.IGNORECASE)
+                    if m_ad:
+                        tenant_from_scp = m_ad.group(1)
+                        if not results.cloud_domain:
+                            results.cloud_domain = tenant_from_scp
+                    results.add(Finding(
+                        "sync_services",
+                        "Entra Connect Service Connection Point in AD",
+                        "The Entra Connect SCP is registered in the AD "
+                        "configuration partition, confirming hybrid "
+                        "identity sync is deployed."
+                        + (f" Cloud tenant: {tenant_from_scp}."
+                           if tenant_from_scp else ""),
+                        severity="HIGH", host=dc_ip,
+                        evidence=(f"DN: {entry.distinguishedName}, "
+                                  f"Keywords: {keywords[:300]}"),
+                    ))
+            else:
+                debug("No Entra Connect SCP found in configuration partition.")
+        except Exception as exc:
+            debug(f"SCP query failed (config partition may not be "
+                  f"accessible): {exc}")
+    else:
+        debug("Could not determine configurationNamingContext for SCP query.")
+
+    # --- AZUREADSSOACC$ (Seamless SSO) ---
     status("Querying AD for AZUREADSSOACC$ (Seamless SSO)...")
     conn.search(base_dn, "(sAMAccountName=AZUREADSSOACC$)", SUBTREE,
-                attributes=["sAMAccountName", "distinguishedName", "whenCreated",
-                             "servicePrincipalName"])
+                attributes=["sAMAccountName", "distinguishedName",
+                             "whenCreated", "servicePrincipalName"])
     if conn.entries:
         for entry in conn.entries:
+            debug(f"AZUREADSSOACC$ found: {entry.distinguishedName}")
             results.add(Finding(
                 "federation",
                 "Seamless SSO account found (AZUREADSSOACC$)",
-                "Extracting this account's Kerberos key enables forging "
-                "cloud auth tickets for any synced user.",
+                "Seamless SSO is configured. Extracting this account's "
+                "Kerberos key enables forging cloud auth tickets for "
+                "any synced user.",
                 severity="CRITICAL", host=dc_ip,
                 evidence=f"DN: {entry.distinguishedName}",
             ))
     else:
         debug("AZUREADSSOACC$ not found.")
 
-    # Entra Connect server
+    # --- Entra Connect server ---
     status("Locating Entra Connect server...")
     conn.search(base_dn,
                 "(&(objectClass=computer)(description=*Azure AD Connect*))",
@@ -382,52 +502,66 @@ def enumerate_ad_cloud_objects(conn: ldap3.Connection,
                 attributes=["cn", "dNSHostName", "operatingSystem",
                              "description", "distinguishedName"])
     if not conn.entries:
+        debug("No Entra Connect server found via description, "
+              "trying SPN search...")
         conn.search(base_dn, "(servicePrincipalName=*ADSync*)", SUBTREE,
                     attributes=["cn", "dNSHostName", "servicePrincipalName",
                                  "distinguishedName"])
     if conn.entries:
         for entry in conn.entries:
-            hostname = entry.dNSHostName if hasattr(entry, "dNSHostName") else entry.cn
+            hostname = (entry.dNSHostName
+                        if hasattr(entry, "dNSHostName") else entry.cn)
+            debug(f"Entra Connect server found: {hostname}")
             results.add(Finding(
                 "sync_services",
                 f"Entra Connect server: {hostname}",
-                "Primary target for ADSync database credential extraction.",
+                "Primary target for ADSync database credential extraction."
+                f" Entra Connect server: {hostname}.",
                 severity="CRITICAL", host=str(hostname),
                 evidence=f"DN: {entry.distinguishedName}",
             ))
     else:
         debug("No Entra Connect server found via LDAP.")
 
-    # ADFS servers
+    # --- ADFS servers ---
     status("Locating ADFS servers...")
     conn.search(base_dn, "(servicePrincipalName=*adfs*)", SUBTREE,
                 attributes=["cn", "dNSHostName", "servicePrincipalName",
                              "distinguishedName"])
     if conn.entries:
         for entry in conn.entries:
-            hostname = entry.dNSHostName if hasattr(entry, "dNSHostName") else entry.cn
+            hostname = (entry.dNSHostName
+                        if hasattr(entry, "dNSHostName") else entry.cn)
+            debug(f"ADFS server found: {hostname}")
             results.add(Finding(
                 "federation", f"ADFS server: {hostname}",
-                "Token-signing certificate enables Golden SAML if compromised.",
+                "Token-signing certificate enables Golden SAML if "
+                "compromised.",
                 severity="CRITICAL", host=str(hostname),
                 evidence=f"DN: {entry.distinguishedName}",
             ))
     else:
         debug("No ADFS servers found via SPN search.")
 
-    # AAD Password Protection
+    # --- AAD Password Protection ---
+    status("Checking for Azure AD Password Protection proxies...")
     conn.search(base_dn, "(servicePrincipalName=*AzureADPasswordProtection*)",
                 SUBTREE, attributes=["cn", "dNSHostName", "distinguishedName"])
-    for entry in conn.entries:
-        results.add(Finding(
-            "cloud_agents",
-            f"Azure AD Password Protection proxy: {entry.cn}",
-            "Cloud policy enforcement on-prem. Proxy communicates with Entra.",
-            severity="MEDIUM", host=str(entry.cn),
-            evidence=f"DN: {entry.distinguishedName}",
-        ))
+    if conn.entries:
+        for entry in conn.entries:
+            debug(f"AAD Password Protection proxy found: {entry.cn}")
+            results.add(Finding(
+                "cloud_agents",
+                f"Azure AD Password Protection proxy: {entry.cn}",
+                "Cloud policy enforcement on-prem. Proxy communicates "
+                "with Entra.",
+                severity="MEDIUM", host=str(entry.cn),
+                evidence=f"DN: {entry.distinguishedName}",
+            ))
+    else:
+        debug("No Azure AD Password Protection proxies found.")
 
-    # Cloud-related SPNs
+    # --- Cloud-related SPNs ---
     status("Checking for cloud-related SPNs...")
     for spn_filter in [
         "(servicePrincipalName=*microsoftonline*)",
@@ -438,8 +572,11 @@ def enumerate_ad_cloud_objects(conn: ldap3.Connection,
         try:
             conn.search(base_dn, spn_filter, SUBTREE,
                         attributes=["cn", "sAMAccountName",
-                                     "servicePrincipalName", "distinguishedName"])
+                                     "servicePrincipalName",
+                                     "distinguishedName"])
             for entry in conn.entries:
+                debug(f"Cloud SPN found: {entry.sAMAccountName} -> "
+                      f"{entry.servicePrincipalName}")
                 results.add(Finding(
                     "cloud_agents",
                     f"Cloud SPN on: {entry.sAMAccountName}",
@@ -450,38 +587,78 @@ def enumerate_ad_cloud_objects(conn: ldap3.Connection,
         except Exception:
             pass
 
-    # Unconstrained delegation
+    # --- Unconstrained delegation ---
     status("Checking for unconstrained delegation...")
     conn.search(base_dn,
                 "(&(objectCategory=computer)"
                 "(userAccountControl:1.2.840.113556.1.4.803:=524288))",
-                SUBTREE, attributes=["cn", "dNSHostName", "distinguishedName"])
+                SUBTREE, attributes=["cn", "dNSHostName",
+                                      "distinguishedName"])
     if conn.entries:
         for entry in conn.entries:
-            hostname = entry.dNSHostName if hasattr(entry, "dNSHostName") else entry.cn
+            hostname = (entry.dNSHostName
+                        if hasattr(entry, "dNSHostName") else entry.cn)
+            debug(f"Unconstrained delegation found: {hostname}")
             results.add(Finding(
                 "delegation", f"Unconstrained delegation: {hostname}",
-                "TGTs cached for any authenticating user. High-value pivot "
-                "if the sync server authenticates here.",
+                "TGTs cached for any authenticating user. High-value "
+                "pivot if the sync server authenticates here.",
                 severity="HIGH", host=str(hostname),
                 evidence=f"DN: {entry.distinguishedName}",
             ))
     else:
         debug("No unconstrained delegation found.")
 
-    # RBCD
+    # --- RBCD ---
+    status("Checking for RBCD configurations...")
     conn.search(base_dn, "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)",
                 SUBTREE,
                 attributes=["cn", "dNSHostName", "distinguishedName",
                              "msDS-AllowedToActOnBehalfOfOtherIdentity"])
-    for entry in conn.entries:
-        hostname = entry.dNSHostName if hasattr(entry, "dNSHostName") else entry.cn
-        results.add(Finding(
-            "delegation", f"RBCD configured on: {hostname}",
-            "Check if this is a sync/federation server with overly broad delegation.",
-            severity="MEDIUM", host=str(hostname),
-            evidence=f"DN: {entry.distinguishedName}",
-        ))
+    if conn.entries:
+        for entry in conn.entries:
+            hostname = (entry.dNSHostName
+                        if hasattr(entry, "dNSHostName") else entry.cn)
+            debug(f"RBCD configured on: {hostname}")
+            results.add(Finding(
+                "delegation", f"RBCD configured on: {hostname}",
+                "Check if this is a sync/federation server with "
+                "overly broad delegation.",
+                severity="MEDIUM", host=str(hostname),
+                evidence=f"DN: {entry.distinguishedName}",
+            ))
+    else:
+        debug("No RBCD configurations found.")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _extract_match_context(content: str, pattern: str,
+                           max_lines: int = 3) -> str:
+    """Extract the actual matching lines from file content."""
+    matches = []
+    for line in content.splitlines():
+        if re.search(pattern, line):
+            clean = line.strip()
+            if len(clean) > 300:
+                clean = clean[:300] + "..."
+            matches.append(clean)
+            if len(matches) >= max_lines:
+                break
+    return ("\n    ".join(matches)
+            if matches else "(pattern matched but no printable line)")
+
+
+def _is_excluded_share_path(file_path: str) -> bool:
+    """Check if any path component matches an excluded directory."""
+    parts = file_path.replace("/", "\\").split("\\")
+    lower_excludes = {d.lower() for d in DEFAULT_EXCLUDE_DIRS}
+    for part in parts:
+        if part.lower() in lower_excludes:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -529,12 +706,17 @@ def check_remote_services(target: str, creds: Credentials,
                 svc_status = scmr.hRQueryServiceStatus(dce, svc_handle)
                 state = svc_status["lpServiceStatus"]["dwCurrentState"]
                 state_str = {1: "stopped", 2: "starting",
-                             3: "stopping", 4: "running"}.get(state, f"unknown({state})")
-                severity = "CRITICAL" if svc_name in ("ADSync", "adfssrv") else "HIGH"
+                             3: "stopping", 4: "running"}.get(
+                    state, f"unknown({state})")
+                severity = ("CRITICAL" if svc_name in ("ADSync", "adfssrv")
+                            else "HIGH")
+                debug(f"Service found on {target}: {svc_name} ({state_str})")
                 results.add(Finding(
                     "sync_services",
                     f"Cloud service on {target}: {svc_name} ({state_str})",
-                    f"Service is {state_str}. This is a Tier 0 cloud boundary server.",
+                    f"Service is {state_str}. This is a Tier 0 cloud "
+                    f"boundary server."
+                    f" Entra Connect server: {target}.",
                     severity=severity, host=target,
                     evidence=f"Service: {svc_name}, State: {state_str}",
                 ))
@@ -578,12 +760,14 @@ def check_remote_registry(target: str, creds: Credentials,
                 hive_handle = rrp.hOpenLocalMachine(dce)["phKey"]
                 key_handle = rrp.hBaseRegOpenKey(
                     dce, hive_handle, key_path)["phkResult"]
+                debug(f"Registry key found on {target}: {agent_name}")
                 results.add(Finding(
                     "cloud_agents",
                     f"Cloud agent on {target}: {agent_name}",
-                    f"Registry key for {agent_name} exists. May hold cached tokens.",
-                    severity="MEDIUM" if "SSM" in agent_name or
-                             "Intune" in agent_name else "HIGH",
+                    f"Registry key for {agent_name} exists. May hold "
+                    f"cached tokens.",
+                    severity=("MEDIUM" if "SSM" in agent_name or
+                              "Intune" in agent_name else "HIGH"),
                     host=target, evidence=f"Key: {hive_name}\\{key_path}",
                 ))
                 rrp.hBaseRegCloseKey(dce, key_handle)
@@ -608,14 +792,18 @@ def check_remote_shares(target: str, creds: Credentials,
         return
 
     files_scanned = 0
+    hits = 0
+    skipped = 0
     for share in shares:
         share_name = share["shi1_netname"][:-1]
         if share_name.upper() in ("IPC$", "PRINT$", "C$", "ADMIN$"):
             continue
-        is_priority = share_name.upper() in [s.upper() for s in INTERESTING_SHARES]
+        is_priority = share_name.upper() in [s.upper()
+                                              for s in INTERESTING_SHARES]
         try:
             file_list = []
-            _walk_share(smb, share_name, "", file_list, max_depth=3, max_files=max_files)
+            _walk_share(smb, share_name, "", file_list,
+                        max_depth=3, max_files=max_files)
             for file_path, file_size in file_list:
                 if files_scanned >= max_files:
                     break
@@ -623,6 +811,13 @@ def check_remote_shares(target: str, creds: Credentials,
                 if ext not in SHARE_SCAN_EXTENSIONS:
                     continue
                 if file_size > 2 * 1024 * 1024:
+                    continue
+                # Skip excluded directories (dev tool artifacts)
+                if _is_excluded_share_path(file_path):
+                    skipped += 1
+                    continue
+                # Skip the scanner itself
+                if SCANNER_FILENAME in file_path.lower():
                     continue
                 files_scanned += 1
                 try:
@@ -638,30 +833,63 @@ def check_remote_shares(target: str, creds: Credentials,
                         offset += len(chunk)
                     smb.closeFile(tid, fh)
                     text = content.decode("utf-8", errors="ignore")
+
+                    # Check tier 1 patterns (actual credential values = HIGH)
+                    matched = False
                     for pattern, label in CREDENTIAL_PATTERNS:
                         if re.search(pattern, text):
+                            hits += 1
+                            matched = True
                             sev = "CRITICAL" if is_priority else "HIGH"
+                            matched_lines = _extract_match_context(
+                                text, pattern)
                             results.add(Finding(
                                 "credentials",
-                                f"Cloud credential: \\\\{target}\\{share_name}\\{file_path}",
-                                f"Pattern \"{label}\" found in a share-accessible file.",
+                                f"Credential found: "
+                                f"\\\\{target}\\{share_name}\\{file_path}",
+                                f"{label} in share-accessible file.",
                                 severity=sev, host=target,
-                                evidence=f"Share: {share_name}, File: {file_path}",
+                                evidence=(
+                                    f"Share: {share_name}\\{file_path}\n"
+                                    f"    {matched_lines}"),
                             ))
                             break
+
+                    # If no tier 1, check tier 2 (references = MEDIUM)
+                    if not matched:
+                        for pattern, label in CREDENTIAL_REF_PATTERNS:
+                            if re.search(pattern, text):
+                                hits += 1
+                                sev = "HIGH" if is_priority else "MEDIUM"
+                                matched_lines = _extract_match_context(
+                                    text, pattern)
+                                results.add(Finding(
+                                    "credentials",
+                                    f"Possible credential ref: "
+                                    f"\\\\{target}\\{share_name}"
+                                    f"\\{file_path}",
+                                    f"{label} in share-accessible file.",
+                                    severity=sev, host=target,
+                                    evidence=(
+                                        f"Share: {share_name}\\{file_path}\n"
+                                        f"    {matched_lines}"),
+                                ))
+                                break
                 except Exception:
                     pass
         except Exception as exc:
             debug(f"Cannot access share {share_name} on {target}: {exc}")
 
-    debug(f"Share scan on {target}: {files_scanned} files checked.")
+    debug(f"Share scan on {target}: {files_scanned} scanned, "
+          f"{hits} hits, {skipped} skipped (excluded dirs).")
     try:
         smb.logoff()
     except Exception:
         pass
 
 
-def _walk_share(smb, share, path, results_list, max_depth=3, max_files=500, depth=0):
+def _walk_share(smb, share, path, results_list,
+                max_depth=3, max_files=500, depth=0):
     if depth > max_depth or len(results_list) >= max_files:
         return
     try:
@@ -672,6 +900,9 @@ def _walk_share(smb, share, path, results_list, max_depth=3, max_files=500, dept
                 continue
             full_path = f"{path}\\{name}" if path else name
             if item.is_directory():
+                # Skip excluded directories early
+                if name.lower() in {d.lower() for d in DEFAULT_EXCLUDE_DIRS}:
+                    continue
                 _walk_share(smb, share, full_path, results_list,
                             max_depth, max_files, depth + 1)
             else:
@@ -700,8 +931,10 @@ def check_cloud_dns(results: ScanResults):
         if reachable:
             results.add(Finding(
                 "network",
-                f"{provider.upper()} endpoints resolvable ({len(reachable)}/{len(domains)})",
-                f"Cloud connectivity to {provider.upper()} confirmed from test network.",
+                f"{provider.upper()} endpoints resolvable "
+                f"({len(reachable)}/{len(domains)})",
+                f"Cloud connectivity to {provider.upper()} confirmed "
+                f"from test network.",
                 severity="INFO", evidence="\n".join(reachable[:6]),
             ))
 
@@ -719,10 +952,11 @@ def check_adfs_metadata(dc_ip: str, creds: Credentials,
             result = sock.connect_ex((ip, 443))
             sock.close()
             if result == 0:
+                debug(f"ADFS endpoint found: {hostname} ({ip})")
                 results.add(Finding(
                     "federation", f"ADFS endpoint: {hostname} ({ip})",
-                    f"Port 443 open. Check https://{hostname}/adfs/ls/ and "
-                    f"the FederationMetadata.xml endpoint.",
+                    f"Port 443 open. Check https://{hostname}/adfs/ls/ "
+                    f"and the FederationMetadata.xml endpoint.",
                     severity="HIGH", host=ip,
                     evidence=f"{hostname} -> {ip}, port 443 open",
                 ))
@@ -738,13 +972,15 @@ def check_adsync_remote(target: str, creds: Credentials,
         return
     adsync_paths = [
         ("C$", "Program Files\\Microsoft Azure AD Sync\\Data\\ADSync.mdf"),
-        ("C$", "Program Files\\Microsoft Azure AD Sync\\Data\\ADSync_log.ldf"),
+        ("C$", "Program Files\\Microsoft Azure AD Sync\\Data\\"
+               "ADSync_log.ldf"),
         ("C$", "ProgramData\\AADConnect\\PersistedState.xml"),
     ]
     for share, path in adsync_paths:
         try:
             smb.connectTree(share)
             smb.listPath(share, path)
+            debug(f"ADSync file accessible on {target}: {path}")
             results.add(Finding(
                 "sync_services", f"ADSync DB accessible: {path}",
                 f"Extractable with local admin and AADInternals at "
@@ -772,33 +1008,66 @@ def print_summary(results: ScanResults):
     cprint("  CLOUD BOUNDARY SCANNER (KALI)  //  RESULTS SUMMARY",
            Colors.BOLD + Colors.CYAN)
     cprint("=" * 70, Colors.BOLD)
-    cprint(f"  Started:       {report['scan_start']}", Colors.WHITE)
-    cprint(f"  Completed:     {report['scan_end']}", Colors.WHITE)
-    cprint(f"  Hosts scanned: {len(report['hosts_scanned'])}", Colors.WHITE)
+
+    # Domain context
+    if report.get("cloud_domain"):
+        cprint(f"  Cloud Tenant:    {report['cloud_domain']}", Colors.WHITE)
+    cprint(f"  On-prem Domain:  {report['onprem_domain']}", Colors.WHITE)
+
+    # Surface discovered boundary servers from findings
+    boundary_servers = []
+    for f in report["findings"]:
+        if f["category"] in ("sync_services", "federation"):
+            # Extract server name from detail text
+            m = re.search(r"Entra Connect server:\s*(\S+)", f["detail"])
+            if m:
+                boundary_servers.append(
+                    (m.group(1).rstrip("."), f["title"]))
+            elif "ADFS server:" in f["title"]:
+                m_host = re.search(r"ADFS server:\s*(\S+)", f["title"])
+                if m_host:
+                    boundary_servers.append(
+                        (m_host.group(1).rstrip("."), f["title"]))
+    if boundary_servers:
+        print()
+        cprint("  Boundary Servers Identified:",
+               Colors.BOLD + Colors.MAGENTA)
+        seen = set()
+        for server, role in boundary_servers:
+            if server not in seen:
+                seen.add(server)
+                cprint(f"    {server}  —  {role}", Colors.MAGENTA)
+    else:
+        print()
+        cprint("  Boundary Servers:  none identified on this scan",
+               Colors.GRAY)
+
+    if DEBUG_MODE:
+        cprint(f"  Started:   {report['scan_start']}", Colors.GRAY)
+        cprint(f"  Completed: {report['scan_end']}", Colors.GRAY)
+    cprint(f"  Hosts scanned: {len(report['hosts_scanned'])}",
+           Colors.WHITE)
     print()
 
     total = report["total_findings"]
+    crits = report["severity_counts"]["CRITICAL"]
+    highs = report["severity_counts"]["HIGH"]
+    meds = report["severity_counts"]["MEDIUM"]
+
     cprint(f"  Total findings: {total}", Colors.BOLD)
-    for sev, color in [("CRITICAL", Colors.RED + Colors.BOLD),
-                        ("HIGH", Colors.RED), ("MEDIUM", Colors.YELLOW),
-                        ("LOW", Colors.CYAN), ("INFO", Colors.GRAY)]:
-        count = report["severity_counts"][sev]
-        if count:
-            cprint(f"    {sev:10s}: {count}", color)
+    if crits:
+        cprint(f"    CRITICAL : {crits}", Colors.RED + Colors.BOLD)
+    if highs:
+        cprint(f"    HIGH     : {highs}", Colors.RED)
+    if meds:
+        cprint(f"    MEDIUM   : {meds}", Colors.YELLOW)
+    if report["severity_counts"]["LOW"]:
+        cprint(f"    LOW      : {report['severity_counts']['LOW']}",
+               Colors.CYAN)
+    if report["severity_counts"]["INFO"]:
+        cprint(f"    INFO     : {report['severity_counts']['INFO']}",
+               Colors.GRAY)
 
-    cprint("=" * 70, Colors.BOLD)
-
-    for finding in results.findings:
-        if finding.severity in ("CRITICAL", "HIGH"):
-            color = Colors.severity_color(finding.severity)
-            host_tag = f" [{finding.host}]" if finding.host else ""
-            print()
-            cprint(f"  [{finding.severity}]{host_tag} {finding.title}", color)
-            cprint(f"    {finding.detail}", Colors.WHITE)
-            if finding.evidence:
-                cprint(f"    Evidence: {finding.evidence[:200]}", Colors.DIM)
-
-    print()
     cprint("=" * 70, Colors.BOLD)
     print()
 
@@ -811,15 +1080,16 @@ def main():
     global DEBUG_MODE
 
     banner = f"""
-{Colors.BOLD}{Colors.CYAN}    ┌──────────────────────────────────────────────┐
-    │   Cloud Boundary Scanner  //  Kali Edition   │
-    │   For authorized penetration testing only    │
-    └──────────────────────────────────────────────┘{Colors.RESET}
+{Colors.BOLD}{Colors.CYAN}    +----------------------------------------------+
+    |   Cloud Boundary Scanner  //  Kali Edition   |
+    |   For authorized penetration testing only    |
+    +----------------------------------------------+{Colors.RESET}
     """
     print(Colors.strip_if_no_tty(banner))
 
     parser = argparse.ArgumentParser(
-        description="Kali-native cloud boundary scanner for authorized pentests.",
+        description="Kali-native cloud boundary scanner for authorized "
+                    "pentests.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -842,7 +1112,8 @@ Examples:
     parser.add_argument("-o", "--output", default=None,
                         help="Write JSON report to file")
     parser.add_argument("--debug", action="store_true",
-                        help="Show all debug output including negative results")
+                        help="Show all debug output including negative "
+                             "results")
     parser.add_argument("--threads", type=int, default=10,
                         help="Max threads for host scanning (default: 10)")
     parser.add_argument("--skip-shares", action="store_true",
@@ -863,11 +1134,12 @@ Examples:
         missing.append("dnspython")
     if missing:
         cprint(f"  [!] Missing: {', '.join(missing)}", Colors.RED)
-        cprint(f"  [!] Install: pip3 install {' '.join(missing)}", Colors.RED)
+        cprint(f"  [!] Install: pip3 install {' '.join(missing)}",
+               Colors.RED)
         sys.exit(1)
 
     creds = Credentials.from_args(args)
-    results = ScanResults()
+    results = ScanResults(onprem_domain=creds.domain)
 
     cprint(f"  Auth: {creds.domain}\\{creds.username}", Colors.WHITE)
     cprint(f"  DC:   {args.dc_ip}", Colors.WHITE)
@@ -906,8 +1178,8 @@ Examples:
             ip = socket.gethostbyname(hostname)
             if ip not in targets:
                 targets.append(ip)
-                cprint(f"  [+] Added LDAP-discovered host: {hostname} ({ip})",
-                       Colors.GREEN)
+                cprint(f"  [+] Added LDAP-discovered host: "
+                       f"{hostname} ({ip})", Colors.GREEN)
         except socket.gaierror:
             pass
 
