@@ -33,6 +33,8 @@ Run directly on a domain-joined Windows host. Uses the current user's session fo
 # Standard scan (shows only relevant findings)
 python cloud_boundary_scanner_win64.py
 
+The credential file scan: This is a cloud-scoped LaZagne style scanner, that scours the filesystem but only looks for cloud-specific secrets, like AWS access keys hardcoded in scripts, Azure SAS tokens in config files, GCP service account JSON keys, PEM private keys, and connection strings. The idea is that admins leave these in PowerShell scripts, .env files, config files on SYSVOL, scheduled task scripts, and similar places. Finding an AWS secret key in a .ps1 on NETLOGON is an instant pivot to cloud from on-prem, which is exactly the boundary crossing this tool is about.
+
 # Save JSON report
 python cloud_boundary_scanner_win64.py -o report.json
 
