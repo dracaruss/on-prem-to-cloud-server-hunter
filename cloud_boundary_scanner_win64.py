@@ -8,7 +8,7 @@ misconfigurations at the hybrid identity boundary.
 
 Usage:
     python cloud_boundary_scanner_win64.py [--output report.json] [--silent]
-    python cloud_boundary_scanner_win64.py -dc 10.0.0.2 [--output report.json]
+    python cloud_boundary_scanner_win64.py -dc 10.0.0.2 -u DOMAIN\\user -p Password1
 
 Requirements:
     - Run from a domain-joined Windows host (ideally with local admin)
@@ -222,6 +222,8 @@ DEFAULT_EXCLUDE_DIRS = {
 DC_TARGET = ""
 DC_BASE_DN = ""
 DC_CONFIG_NC = ""
+DC_USER = ""
+DC_PASS = ""
 
 # ---------------------------------------------------------------------------
 # Finding / Results
@@ -358,14 +360,25 @@ def _adsi_searcher(base_dn_override: str = "") -> str:
     """Return PowerShell to create a DirectorySearcher, targeting remote DC if set."""
     if DC_TARGET:
         base = base_dn_override or DC_BASE_DN
+        if DC_USER and DC_PASS:
+            escaped_pass = DC_PASS.replace("'", "''")
+            return (f"$entry = New-Object DirectoryServices.DirectoryEntry("
+                    f"'LDAP://{DC_TARGET}/{base}','{DC_USER}','{escaped_pass}');"
+                    f"$s = New-Object DirectoryServices.DirectorySearcher($entry);")
         return (f"$s = New-Object DirectoryServices.DirectorySearcher("
                 f"[ADSI]'LDAP://{DC_TARGET}/{base}');")
     return "$s = New-Object DirectoryServices.DirectorySearcher;"
 
 
 def _rsat_server() -> str:
-    """Return -Server parameter string for RSAT cmdlets when targeting a remote DC."""
+    """Return -Server and optional -Credential for RSAT cmdlets targeting a remote DC."""
     if DC_TARGET:
+        if DC_USER and DC_PASS:
+            escaped_pass = DC_PASS.replace("'", "''")
+            return (f"-Server {DC_TARGET} "
+                    f"-Credential (New-Object System.Management.Automation.PSCredential("
+                    f"'{DC_USER}',(ConvertTo-SecureString '{escaped_pass}' "
+                    f"-AsPlainText -Force))) ")
         return f"-Server {DC_TARGET} "
     return ""
 
@@ -464,9 +477,16 @@ def check_sync_services(results: ScanResults):
     if DC_TARGET and DC_CONFIG_NC:
         scp_base = (f"CN=Device Registration Configuration,"
                     f"CN=Services,{DC_CONFIG_NC}")
+        if DC_USER and DC_PASS:
+            escaped_pass = DC_PASS.replace("'", "''")
+            scp_entry = (f"$entry = New-Object DirectoryServices.DirectoryEntry("
+                         f"'LDAP://{DC_TARGET}/{scp_base}',"
+                         f"'{DC_USER}','{escaped_pass}');")
+        else:
+            scp_entry = (f"$entry = [ADSI]'LDAP://{DC_TARGET}/{scp_base}';")
         scp_check = run_powershell(
-            f"$s = New-Object DirectoryServices.DirectorySearcher("
-            f"[ADSI]'LDAP://{DC_TARGET}/{scp_base}');"
+            f"{scp_entry}"
+            "$s = New-Object DirectoryServices.DirectorySearcher($entry);"
             "$s.Filter = '(objectClass=serviceConnectionPoint)';"
             "$s.PropertiesToLoad.AddRange(@('keywords','distinguishedname'));"
             "$r = $s.FindAll();"
@@ -1206,7 +1226,7 @@ def print_summary(results: ScanResults):
 # ---------------------------------------------------------------------------
 
 def main():
-    global DEBUG_MODE, DC_TARGET, DC_BASE_DN, DC_CONFIG_NC
+    global DEBUG_MODE, DC_TARGET, DC_BASE_DN, DC_CONFIG_NC, DC_USER, DC_PASS
 
     parser = argparse.ArgumentParser(
         description="Cloud Boundary Scanner (Windows)")
@@ -1216,6 +1236,13 @@ def main():
                         help="Target a remote domain controller by IP. "
                              "Queries that DC's domain for sync objects "
                              "instead of the local domain.")
+    parser.add_argument("-u", "--user", type=str, default="",
+                        help="Username for remote DC authentication "
+                             "(DOMAIN\\\\user or user@domain). "
+                             "Required with -dc for cross-domain queries.")
+    parser.add_argument("-p", "--password", type=str, default="",
+                        help="Password for remote DC authentication. "
+                             "Used with -u for explicit LDAP bind.")
     parser.add_argument("--silent", action="store_true",
                         help="Reduce output (suppress debug/negative results).")
     parser.add_argument("--debug", action="store_true",
@@ -1244,11 +1271,23 @@ def main():
     # Resolve remote DC if specified
     if args.dc:
         DC_TARGET = args.dc
+        if args.user:
+            DC_USER = args.user
+        if args.password:
+            DC_PASS = args.password
         status(f"Resolving base DN from remote DC {DC_TARGET}...")
-        rootdse_out = run_powershell(
-            f"$r = [ADSI]'LDAP://{DC_TARGET}/RootDSE'; "
-            f"$r.defaultNamingContext[0] + '|' + "
-            f"$r.configurationNamingContext[0]")
+        if DC_USER and DC_PASS:
+            escaped_pass = DC_PASS.replace("'", "''")
+            rootdse_out = run_powershell(
+                f"$r = New-Object DirectoryServices.DirectoryEntry("
+                f"'LDAP://{DC_TARGET}/RootDSE','{DC_USER}','{escaped_pass}'); "
+                f"$r.defaultNamingContext[0] + '|' + "
+                f"$r.configurationNamingContext[0]")
+        else:
+            rootdse_out = run_powershell(
+                f"$r = [ADSI]'LDAP://{DC_TARGET}/RootDSE'; "
+                f"$r.defaultNamingContext[0] + '|' + "
+                f"$r.configurationNamingContext[0]")
         if rootdse_out and "|" in rootdse_out:
             parts = rootdse_out.strip().split("|", 1)
             DC_BASE_DN = parts[0].strip()

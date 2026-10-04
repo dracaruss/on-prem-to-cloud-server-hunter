@@ -2,8 +2,6 @@
 
 Enumerates the on-prem to cloud boundary during authorized penetration tests. Finds sync services, cached cloud credentials, federation misconfigurations, cloud bridge agents, and pivot paths between Active Directory and cloud tenants (Azure/Entra ID, AWS, GCP).
 
-The credential file scan segment of this tool is a cloud-scoped LaZagne style scanner, that scours the filesystem for cloud-specific secrets, like AWS access keys hardcoded in scripts, Azure SAS tokens in config files, GCP service account JSON keys, PEM private keys, and connection strings. The idea is that admins leave these in PowerShell scripts, .env files, config files on SYSVOL, scheduled task scripts, and similar places. Finding an AWS secret key in a .ps1 on NETLOGON is an instant pivot to cloud from on-prem, which is exactly the boundary crossing this tool is about.
-
 Two versions are included: one for Windows-based engagements and one for Kali-based engagements.
 
 ## What It Checks
@@ -40,11 +38,11 @@ python cloud_boundary_scanner_win64.py
 # Save JSON report
 python cloud_boundary_scanner_win64.py -o report.json
 
-# Query a remote DC to find sync objects in another domain (useful when sync infra lives in a different domain)
-python cloud_boundary_scanner_win64.py -dc 10.0.0.2
+# Query a remote DC in another domain with explicit credentials
+python cloud_boundary_scanner_win64.py -dc 10.0.0.2 -u 'CORP\jsmith' -p 'Password1'
 
 # Combine remote DC targeting with JSON output
-python cloud_boundary_scanner_win64.py -dc 10.0.0.2 -o report.json
+python cloud_boundary_scanner_win64.py -dc 10.0.0.2 -u 'CORP\jsmith' -p 'Password1' -o report.json
 
 # Reduced output (suppress debug/negative results)
 python cloud_boundary_scanner_win64.py --silent
@@ -79,6 +77,8 @@ python3 cloud_boundary_scanner_kali.py -u 'CORP\jsmith' -p 'Password1' -dc 10.0.
 | Argument | Description |
 |----------|-------------|
 | `-dc` | Remote domain controller IP to query (for cross-domain sync enumeration) |
+| `-u` | Username for remote DC auth (`DOMAIN\user` or `user@domain`), used with `-dc` |
+| `-p` | Password for remote DC auth, used with `-u` |
 | `-o` | Output JSON report path |
 | `--silent` | Reduce output (suppress debug/negative results) |
 | `--debug` | No-op, kept for backward compatibility (verbose is now the default) |
