@@ -2,6 +2,8 @@
 
 Enumerates the on-prem to cloud boundary during authorized penetration tests. Finds sync services, cached cloud credentials, federation misconfigurations, cloud bridge agents, and pivot paths between Active Directory and cloud tenants (Azure/Entra ID, AWS, GCP).
 
+The credential file scan segment of this tool is a cloud-scoped LaZagne style scanner, that scours the filesystem for cloud-specific secrets, like AWS access keys hardcoded in scripts, Azure SAS tokens in config files, GCP service account JSON keys, PEM private keys, and connection strings. The idea is that admins leave these in PowerShell scripts, .env files, config files on SYSVOL, scheduled task scripts, and similar places. Finding an AWS secret key in a .ps1 on NETLOGON is an instant pivot to cloud from on-prem, which is exactly the boundary crossing this tool is about.
+
 Two versions are included: one for Windows-based engagements and one for Kali-based engagements.
 
 ## What It Checks
